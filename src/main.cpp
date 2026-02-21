@@ -81,8 +81,86 @@ void printHex(uint8_t val) {
   Serial.print(val, HEX);
 }
 
-// Default key for MIFARE Classic authentication
-uint8_t defaultKey[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+// Common MIFARE Classic keys found in the wild
+const uint8_t KNOWN_KEYS[][6] = {
+  {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},  // Factory default
+  {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5},  // MAD key A
+  {0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5},  // MAD key B
+  {0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7},  // NFC Forum / NDEF
+  {0x00, 0x00, 0x00, 0x00, 0x00, 0x00},  // Zeros
+  {0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0},  // Common transport
+  {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF},  // Common transport
+  {0x4D, 0x3A, 0x99, 0xC3, 0x51, 0xDD},  // Infineon
+  {0x1A, 0x98, 0x2C, 0x7E, 0x45, 0x9A},  // Gallagher
+  {0x71, 0x4C, 0x5C, 0x88, 0x6E, 0x97},  // Samsung/Philips
+};
+const uint8_t NUM_KNOWN_KEYS = sizeof(KNOWN_KEYS) / sizeof(KNOWN_KEYS[0]);
+
+// Test all known keys on every sector of a MIFARE Classic tag
+void testClassicKeys(uint8_t *uid, uint8_t uidLen, TagType type) {
+  uint8_t numSectors = (type == TAG_MIFARE_CLASSIC_4K) ? 40 : 16;
+
+  Serial.println("  --- MIFARE Classic Key Audit ---");
+  Serial.println("  Sect | Key A found              | Key B found");
+  Serial.println("  -----+--------------------------+--------------------------");
+
+  for (uint8_t sector = 0; sector < numSectors; sector++) {
+    // First block of each sector (trailer block is used for auth)
+    uint8_t firstBlock;
+    if (sector < 32) {
+      firstBlock = sector * 4;
+    } else {
+      firstBlock = 128 + (sector - 32) * 16;
+    }
+
+    Serial.print("  ");
+    if (sector < 10) Serial.print(" ");
+    Serial.print(sector);
+    Serial.print("  | ");
+
+    // Try Key A (type 0)
+    bool foundA = false;
+    for (uint8_t k = 0; k < NUM_KNOWN_KEYS; k++) {
+      if (nfc.mifareclassic_AuthenticateBlock(uid, uidLen, firstBlock, 0, (uint8_t *)KNOWN_KEYS[k])) {
+        foundA = true;
+        for (uint8_t i = 0; i < 6; i++) {
+          printHex(KNOWN_KEYS[k][i]);
+          if (i < 5) Serial.print(":");
+        }
+        Serial.print(" (A)");
+        break;
+      }
+    }
+    if (!foundA) {
+      Serial.print("-- none matched --    ");
+    }
+
+    Serial.print(" | ");
+
+    // Try Key B (type 1)
+    bool foundB = false;
+    for (uint8_t k = 0; k < NUM_KNOWN_KEYS; k++) {
+      if (nfc.mifareclassic_AuthenticateBlock(uid, uidLen, firstBlock, 1, (uint8_t *)KNOWN_KEYS[k])) {
+        foundB = true;
+        for (uint8_t i = 0; i < 6; i++) {
+          printHex(KNOWN_KEYS[k][i]);
+          if (i < 5) Serial.print(":");
+        }
+        Serial.print(" (B)");
+        break;
+      }
+    }
+    if (!foundB) {
+      Serial.print("-- none matched --");
+    }
+
+    Serial.println();
+  }
+
+  Serial.print("  Keys tested per sector: ");
+  Serial.print(NUM_KNOWN_KEYS);
+  Serial.println(" known keys x 2 (A+B)");
+}
 
 // Dump MIFARE Classic 1K: 16 sectors, 4 blocks each (64 blocks total)
 // Classic 4K: 32 sectors x 4 blocks + 8 sectors x 16 blocks (256 blocks total)
@@ -106,7 +184,7 @@ void dumpMifareClassic(uint8_t *uid, uint8_t uidLen, TagType type) {
     }
 
     if (block == sectorFirstBlock) {
-      if (!nfc.mifareclassic_AuthenticateBlock(uid, uidLen, block, 0, defaultKey)) {
+      if (!nfc.mifareclassic_AuthenticateBlock(uid, uidLen, block, 0, (uint8_t *)KNOWN_KEYS[0])) {
         // Print the sector as unreadable
         uint8_t blocksInSector = (block < 128) ? 4 : 16;
         for (uint8_t b = 0; b < blocksInSector && (block + b) < totalBlocks; b++) {
@@ -250,9 +328,11 @@ void loop() {
     printHex(sak);
     Serial.println();
 
-    // Memory dump based on tag type
+    // Memory dump and key audit based on tag type
     if (tag.type == TAG_MIFARE_CLASSIC_1K || tag.type == TAG_MIFARE_CLASSIC_4K) {
       dumpMifareClassic(uid, uidLength, tag.type);
+      Serial.println();
+      testClassicKeys(uid, uidLength, tag.type);
     } else if (tag.type == TAG_MIFARE_ULTRALIGHT) {
       dumpUltralight();
     } else {
