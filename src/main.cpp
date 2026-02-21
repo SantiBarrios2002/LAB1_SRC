@@ -10,22 +10,8 @@
 
 Adafruit_PN532 nfc(PN532_SS);
 
-uint8_t keyA_default[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-
-const char* identifyTagType(uint8_t *uid, uint8_t uidLength) {
-  // Try Mifare Classic authentication
-  if (nfc.mifareclassic_AuthenticateBlock(uid, uidLength, 4, 0, keyA_default)) {
-    return "Mifare Classic";
-  }
-
-  // Try Mifare Ultralight / NTAG read
-  uint8_t pageData[4];
-  if (nfc.mifareultralight_ReadPage(4, pageData)) {
-    return "Mifare Ultralight / NTAG2xx";
-  }
-
-  return "Unknown";
-}
+// Access the library's internal packet buffer to read ATQA/SAK
+extern byte pn532_packetbuffer[];
 
 void setup() {
   Serial.begin(115200);
@@ -60,19 +46,34 @@ void loop() {
   uint8_t uidLength;
 
   if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 1000)) {
-    // Print UID
-    Serial.print("UID: ");
+    // ATQA and SAK are in the packet buffer right after readPassiveTargetID
+    uint16_t atqa = (pn532_packetbuffer[9] << 8) | pn532_packetbuffer[10];
+    uint8_t sak = pn532_packetbuffer[11];
+
+    // UID
+    Serial.print("UID (");
+    Serial.print(uidLength);
+    Serial.print(" bytes): ");
     for (uint8_t i = 0; i < uidLength; i++) {
       if (uid[i] < 0x10) Serial.print("0");
       Serial.print(uid[i], HEX);
       if (i < uidLength - 1) Serial.print(":");
     }
+    Serial.println();
 
-    // Identify and print type
-    const char* tagType = identifyTagType(uid, uidLength);
-    Serial.print(" -> ");
-    Serial.println(tagType);
+    // ATQA
+    Serial.print("  ATQA: 0x");
+    if (atqa < 0x1000) Serial.print("0");
+    if (atqa < 0x100) Serial.print("0");
+    if (atqa < 0x10) Serial.print("0");
+    Serial.println(atqa, HEX);
 
+    // SAK
+    Serial.print("  SAK:  0x");
+    if (sak < 0x10) Serial.print("0");
+    Serial.println(sak, HEX);
+
+    Serial.println();
     delay(1500);
   }
 }
