@@ -13,14 +13,16 @@ Adafruit_PN532 nfc(PN532_SS);
 // Access the library's internal packet buffer to read ATQA/SAK
 extern byte pn532_packetbuffer[];
 
-// Tag type enumeration
+// ============================================================
+// Tag types and identification
+// ============================================================
+
 enum TagType {
   TAG_MIFARE_CLASSIC_1K,
   TAG_MIFARE_CLASSIC_4K,
   TAG_MIFARE_ULTRALIGHT,
   TAG_MIFARE_PLUS,
   TAG_MIFARE_DESFIRE,
-  TAG_NTAG_213_215_216,
   TAG_ISO14443_4,
   TAG_UNKNOWN
 };
@@ -30,58 +32,70 @@ struct TagInfo {
   const char *name;
   uint16_t atqa;
   uint8_t sak;
+  uint8_t uid[7];
   uint8_t uidLen;
 };
 
-// Identify tag from SAK, ATQA and UID length
-// SAK is the primary identifier per ISO 14443-3
-TagInfo identifyTag(uint16_t atqa, uint8_t sak, uint8_t uidLen) {
+// Currently scanned tag (persists between commands)
+TagInfo currentTag;
+bool hasTag = false;
+
+// Clone buffer
+uint8_t cloneBuf[1024];  // enough for Classic 1K (64 blocks x 16 bytes)
+uint16_t cloneLen = 0;
+TagType cloneType = TAG_UNKNOWN;
+uint8_t cloneUid[7];
+uint8_t cloneUidLen = 0;
+
+TagInfo identifyTag(uint16_t atqa, uint8_t sak, uint8_t *uid, uint8_t uidLen) {
   TagInfo info;
   info.atqa = atqa;
   info.sak = sak;
   info.uidLen = uidLen;
+  memcpy(info.uid, uid, uidLen);
 
-  if (sak == 0x08) {
-    info.type = TAG_MIFARE_CLASSIC_1K;
-    info.name = "MIFARE Classic 1K";
+  if (sak == 0x08 || sak == 0x09) {
+    info.type = (sak == 0x09) ? TAG_MIFARE_CLASSIC_1K : TAG_MIFARE_CLASSIC_1K;
+    info.name = (sak == 0x09) ? "MIFARE Classic Mini" : "MIFARE Classic 1K";
   } else if (sak == 0x18) {
     info.type = TAG_MIFARE_CLASSIC_4K;
     info.name = "MIFARE Classic 4K";
-  } else if (sak == 0x09) {
-    info.type = TAG_MIFARE_CLASSIC_1K;
-    info.name = "MIFARE Classic Mini";
-  } else if (sak == 0x00 && uidLen == 7) {
+  } else if (sak == 0x00) {
     info.type = TAG_MIFARE_ULTRALIGHT;
-    info.name = "MIFARE Ultralight / NTAG";
-  } else if (sak == 0x00 && uidLen == 4) {
-    info.type = TAG_MIFARE_ULTRALIGHT;
-    info.name = "MIFARE Ultralight (4-byte UID)";
-  } else if (sak == 0x10) {
+    info.name = (uidLen == 7) ? "MIFARE Ultralight / NTAG" : "MIFARE Ultralight";
+  } else if (sak == 0x10 || sak == 0x11) {
     info.type = TAG_MIFARE_PLUS;
-    info.name = "MIFARE Plus 2K (SL2)";
-  } else if (sak == 0x11) {
-    info.type = TAG_MIFARE_PLUS;
-    info.name = "MIFARE Plus 4K (SL2)";
+    info.name = (sak == 0x10) ? "MIFARE Plus 2K" : "MIFARE Plus 4K";
   } else if (sak == 0x20 && (atqa & 0x0F) == 0x03) {
     info.type = TAG_MIFARE_DESFIRE;
     info.name = "MIFARE DESFire";
   } else if (sak == 0x20) {
     info.type = TAG_ISO14443_4;
-    info.name = "ISO 14443-4 (SAK 0x20)";
+    info.name = "ISO 14443-4";
   } else {
     info.type = TAG_UNKNOWN;
     info.name = "Unknown";
   }
-
   return info;
 }
+
+// ============================================================
+// Helpers
+// ============================================================
 
 void printHex(uint8_t val) {
   if (val < 0x10) Serial.print("0");
   Serial.print(val, HEX);
 }
 
-// Common MIFARE Classic keys found in the wild
+void printUid(uint8_t *uid, uint8_t len) {
+  for (uint8_t i = 0; i < len; i++) {
+    printHex(uid[i]);
+    if (i < len - 1) Serial.print(":");
+  }
+}
+
+// Common MIFARE Classic keys
 const uint8_t KNOWN_KEYS[][6] = {
   {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},  // Factory default
   {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5},  // MAD key A
@@ -96,16 +110,12 @@ const uint8_t KNOWN_KEYS[][6] = {
 };
 const uint8_t NUM_KNOWN_KEYS = sizeof(KNOWN_KEYS) / sizeof(KNOWN_KEYS[0]);
 
-// Re-select the card after a failed auth (card goes to HALT state)
 bool reselectCard(void) {
   uint8_t uid[7];
   uint8_t uidLen;
   return nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen, 500);
 }
 
-// Try to authenticate a block with all known keys, re-selecting after each failure.
-// Returns the key index that worked, or -1 if none matched.
-// keyType: 0 = Key A, 1 = Key B
 int8_t tryAuthBlock(uint8_t *uid, uint8_t uidLen, uint8_t block, uint8_t keyType) {
   for (uint8_t k = 0; k < NUM_KNOWN_KEYS; k++) {
     if (nfc.mifareclassic_AuthenticateBlock(uid, uidLen, block, keyType, (uint8_t *)KNOWN_KEYS[k])) {
@@ -116,125 +126,88 @@ int8_t tryAuthBlock(uint8_t *uid, uint8_t uidLen, uint8_t block, uint8_t keyType
   return -1;
 }
 
-// Test all known keys on every sector of a MIFARE Classic tag
-void testClassicKeys(uint8_t *uid, uint8_t uidLen, TagType type) {
-  uint8_t numSectors = (type == TAG_MIFARE_CLASSIC_4K) ? 40 : 16;
+// ============================================================
+// Command: SCAN
+// ============================================================
 
-  Serial.println("  --- MIFARE Classic Key Audit ---");
-  Serial.println("  Sect | Key A found              | Key B found");
-  Serial.println("  -----+--------------------------+--------------------------");
+void cmdScan() {
+  Serial.println("Place tag on reader...");
+  uint8_t uid[7];
+  uint8_t uidLen;
 
-  for (uint8_t sector = 0; sector < numSectors; sector++) {
-    // First block of each sector (trailer block is used for auth)
-    uint8_t firstBlock;
-    if (sector < 32) {
-      firstBlock = sector * 4;
-    } else {
-      firstBlock = 128 + (sector - 32) * 16;
-    }
-
-    Serial.print("  ");
-    if (sector < 10) Serial.print(" ");
-    Serial.print(sector);
-    Serial.print("  | ");
-
-    // Try Key A (type 0)
-    int8_t keyA = tryAuthBlock(uid, uidLen, firstBlock, 0);
-    if (keyA >= 0) {
-      for (uint8_t i = 0; i < 6; i++) {
-        printHex(KNOWN_KEYS[keyA][i]);
-        if (i < 5) Serial.print(":");
-      }
-      Serial.print(" (A)");
-    } else {
-      Serial.print("-- none matched --    ");
-    }
-
-    Serial.print(" | ");
-
-    // Try Key B (type 1)
-    int8_t keyB = tryAuthBlock(uid, uidLen, firstBlock, 1);
-    if (keyB >= 0) {
-      for (uint8_t i = 0; i < 6; i++) {
-        printHex(KNOWN_KEYS[keyB][i]);
-        if (i < 5) Serial.print(":");
-      }
-      Serial.print(" (B)");
-    } else {
-      Serial.print("-- none matched --");
-    }
-
-    Serial.println();
+  // Wait up to 10 seconds
+  if (!nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen, 10000)) {
+    Serial.println("No tag found.");
+    return;
   }
 
-  Serial.print("  Keys tested per sector: ");
-  Serial.print(NUM_KNOWN_KEYS);
-  Serial.println(" known keys x 2 (A+B)");
+  uint16_t atqa = (pn532_packetbuffer[9] << 8) | pn532_packetbuffer[10];
+  uint8_t sak = pn532_packetbuffer[11];
+
+  currentTag = identifyTag(atqa, sak, uid, uidLen);
+  hasTag = true;
+
+  Serial.print("Tag: ");
+  Serial.println(currentTag.name);
+  Serial.print("  UID (");
+  Serial.print(uidLen);
+  Serial.print("): ");
+  printUid(uid, uidLen);
+  Serial.println();
+  Serial.print("  ATQA: 0x");
+  if (atqa < 0x1000) Serial.print("0");
+  if (atqa < 0x100) Serial.print("0");
+  if (atqa < 0x10) Serial.print("0");
+  Serial.print(atqa, HEX);
+  Serial.print("  SAK: 0x");
+  printHex(sak);
+  Serial.println();
 }
 
-// Dump MIFARE Classic 1K: 16 sectors, 4 blocks each (64 blocks total)
-// Classic 4K: 32 sectors x 4 blocks + 8 sectors x 16 blocks (256 blocks total)
-void dumpMifareClassic(uint8_t *uid, uint8_t uidLen, TagType type) {
-  uint8_t totalBlocks = (type == TAG_MIFARE_CLASSIC_4K) ? 256 : 64;
+// ============================================================
+// Command: DUMP
+// ============================================================
+
+void dumpClassic(uint8_t *uid, uint8_t uidLen, TagType type) {
+  uint16_t totalBlocks = (type == TAG_MIFARE_CLASSIC_4K) ? 256 : 64;
   uint8_t data[16];
 
-  Serial.println("  --- MIFARE Classic Memory Dump ---");
-  Serial.println("  Blk | Data                                          | ASCII");
-  Serial.println("  ----+--------------------------------------------------+------------------");
+  Serial.println("--- MIFARE Classic Memory Dump ---");
+  Serial.println("Blk | Data                                          | ASCII");
+  Serial.println("----+--------------------------------------------------+------------------");
 
-  for (uint8_t block = 0; block < totalBlocks; block++) {
-    // Authenticate at the start of each sector
-    // Classic 1K/Mini: 4 blocks per sector
-    // Classic 4K: 4 blocks per sector for first 32, 16 blocks per sector after
-    uint8_t sectorFirstBlock;
-    if (block < 128) {
-      sectorFirstBlock = block - (block % 4);
-    } else {
-      sectorFirstBlock = block - (block % 16);
-    }
+  for (uint16_t block = 0; block < totalBlocks; block++) {
+    uint16_t sectorFirst = (block < 128) ? (block - (block % 4)) : (block - (block % 16));
 
-    if (block == sectorFirstBlock) {
-      // Try all known keys with re-select between failures
-      bool authenticated = (tryAuthBlock(uid, uidLen, block, 0) >= 0);
-      if (!authenticated) {
-        authenticated = (tryAuthBlock(uid, uidLen, block, 1) >= 0);
-      }
-      if (!authenticated) {
-        uint8_t blocksInSector = (block < 128) ? 4 : 16;
-        for (uint8_t b = 0; b < blocksInSector && (block + b) < totalBlocks; b++) {
-          Serial.print("  ");
+    if (block == sectorFirst) {
+      bool auth = (tryAuthBlock(uid, uidLen, block, 0) >= 0);
+      if (!auth) auth = (tryAuthBlock(uid, uidLen, block, 1) >= 0);
+      if (!auth) {
+        uint16_t blocksInSector = (block < 128) ? 4 : 16;
+        for (uint16_t b = 0; b < blocksInSector && (block + b) < totalBlocks; b++) {
+          Serial.print(" ");
           if ((block + b) < 10) Serial.print(" ");
           if ((block + b) < 100) Serial.print(" ");
           Serial.print(block + b);
-          Serial.println(" | AUTH FAILED (no known key)                       |");
+          Serial.println(" | AUTH FAILED                                      |");
         }
-        block = sectorFirstBlock + ((block < 128) ? 3 : 15);
+        block = sectorFirst + ((block < 128) ? 3 : 15);
         continue;
       }
     }
 
     if (nfc.mifareclassic_ReadDataBlock(block, data)) {
-      // Block number
-      Serial.print("  ");
       if (block < 10) Serial.print(" ");
       if (block < 100) Serial.print(" ");
       Serial.print(block);
       Serial.print(" | ");
-
-      // Hex
-      for (uint8_t i = 0; i < 16; i++) {
-        printHex(data[i]);
-        Serial.print(" ");
-      }
+      for (uint8_t i = 0; i < 16; i++) { printHex(data[i]); Serial.print(" "); }
       Serial.print("| ");
-
-      // ASCII
       for (uint8_t i = 0; i < 16; i++) {
         Serial.print((data[i] >= 0x20 && data[i] <= 0x7E) ? (char)data[i] : '.');
       }
       Serial.println();
     } else {
-      Serial.print("  ");
       if (block < 10) Serial.print(" ");
       if (block < 100) Serial.print(" ");
       Serial.print(block);
@@ -243,36 +216,22 @@ void dumpMifareClassic(uint8_t *uid, uint8_t uidLen, TagType type) {
   }
 }
 
-// Dump MIFARE Ultralight / NTAG: 4 bytes per page
-// Ultralight: 16 pages, Ultralight C: 48 pages, NTAG213: 45, NTAG215: 135, NTAG216: 231
-// We read until we get a failure, which indicates end of memory
-void dumpUltralight(void) {
+void dumpUltralight() {
   uint8_t data[4];
 
-  Serial.println("  --- Ultralight / NTAG Memory Dump ---");
-  Serial.println("  Page | Data        | ASCII");
-  Serial.println("  -----+-------------+------");
+  Serial.println("--- Ultralight / NTAG Memory Dump ---");
+  Serial.println("Page | Data        | ASCII");
+  Serial.println("-----+-------------+------");
 
-  for (uint8_t page = 0; page < 231; page++) {
-    if (!nfc.mifareultralight_ReadPage(page, data)) {
-      break;
-    }
+  for (uint16_t page = 0; page < 231; page++) {
+    if (!nfc.mifareultralight_ReadPage(page, data)) break;
 
-    // Page number
-    Serial.print("  ");
     if (page < 10) Serial.print(" ");
     if (page < 100) Serial.print(" ");
     Serial.print(page);
     Serial.print("  | ");
-
-    // Hex
-    for (uint8_t i = 0; i < 4; i++) {
-      printHex(data[i]);
-      Serial.print(" ");
-    }
+    for (uint8_t i = 0; i < 4; i++) { printHex(data[i]); Serial.print(" "); }
     Serial.print("| ");
-
-    // ASCII
     for (uint8_t i = 0; i < 4; i++) {
       Serial.print((data[i] >= 0x20 && data[i] <= 0x7E) ? (char)data[i] : '.');
     }
@@ -280,68 +239,98 @@ void dumpUltralight(void) {
   }
 }
 
+void cmdDump() {
+  if (!hasTag) { Serial.println("No tag scanned. Run SCAN first."); return; }
+
+  Serial.println("Hold tag on reader for dump...");
+  if (!reselectCard()) { Serial.println("Tag not present."); return; }
+
+  if (currentTag.type == TAG_MIFARE_CLASSIC_1K || currentTag.type == TAG_MIFARE_CLASSIC_4K) {
+    dumpClassic(currentTag.uid, currentTag.uidLen, currentTag.type);
+  } else if (currentTag.type == TAG_MIFARE_ULTRALIGHT) {
+    dumpUltralight();
+  } else {
+    Serial.println("Dump not supported for this tag type.");
+  }
+}
+
+// ============================================================
+// Command: KEYS
+// ============================================================
+
+void cmdKeys() {
+  if (!hasTag) { Serial.println("No tag scanned. Run SCAN first."); return; }
+  if (currentTag.type != TAG_MIFARE_CLASSIC_1K && currentTag.type != TAG_MIFARE_CLASSIC_4K) {
+    Serial.println("Key audit only applies to MIFARE Classic.");
+    return;
+  }
+
+  Serial.println("Hold tag on reader for key audit...");
+  if (!reselectCard()) { Serial.println("Tag not present."); return; }
+
+  uint8_t numSectors = (currentTag.type == TAG_MIFARE_CLASSIC_4K) ? 40 : 16;
+
+  Serial.println("--- MIFARE Classic Key Audit ---");
+  Serial.println("Sect | Key A found              | Key B found");
+  Serial.println("-----+--------------------------+--------------------------");
+
+  for (uint8_t sector = 0; sector < numSectors; sector++) {
+    uint8_t firstBlock = (sector < 32) ? sector * 4 : 128 + (sector - 32) * 16;
+
+    if (sector < 10) Serial.print(" ");
+    Serial.print(sector);
+    Serial.print("   | ");
+
+    int8_t keyA = tryAuthBlock(currentTag.uid, currentTag.uidLen, firstBlock, 0);
+    if (keyA >= 0) {
+      for (uint8_t i = 0; i < 6; i++) { printHex(KNOWN_KEYS[keyA][i]); if (i < 5) Serial.print(":"); }
+      Serial.print(" (A)");
+    } else {
+      Serial.print("-- none matched --    ");
+    }
+
+    Serial.print(" | ");
+
+    int8_t keyB = tryAuthBlock(currentTag.uid, currentTag.uidLen, firstBlock, 1);
+    if (keyB >= 0) {
+      for (uint8_t i = 0; i < 6; i++) { printHex(KNOWN_KEYS[keyB][i]); if (i < 5) Serial.print(":"); }
+      Serial.print(" (B)");
+    } else {
+      Serial.print("-- none matched --");
+    }
+    Serial.println();
+  }
+
+  Serial.print("Keys tested: ");
+  Serial.print(NUM_KNOWN_KEYS);
+  Serial.println(" known keys x 2 (A+B) per sector");
+}
+
 // ============================================================
 // NDEF Parser
 // ============================================================
 
-// URI prefix lookup table per NFC Forum URI RTD specification
 const char *URI_PREFIXES[] = {
-  "",                           // 0x00
-  "http://www.",                // 0x01
-  "https://www.",               // 0x02
-  "http://",                    // 0x03
-  "https://",                   // 0x04
-  "tel:",                       // 0x05
-  "mailto:",                    // 0x06
-  "ftp://anonymous:anonymous@", // 0x07
-  "ftp://ftp.",                 // 0x08
-  "ftps://",                    // 0x09
-  "sftp://",                    // 0x0A
-  "smb://",                     // 0x0B
-  "nfs://",                     // 0x0C
-  "ftp://",                     // 0x0D
-  "dav://",                     // 0x0E
-  "news:",                      // 0x0F
-  "telnet://",                  // 0x10
-  "imap:",                      // 0x11
-  "rtsp://",                    // 0x12
-  "urn:",                       // 0x13
-  "pop:",                       // 0x14
-  "sip:",                       // 0x15
-  "sips:",                      // 0x16
-  "tftp:",                      // 0x17
-  "btspp://",                   // 0x18
-  "btl2cap://",                 // 0x19
-  "btgoep://",                  // 0x1A
-  "tcpobex://",                 // 0x1B
-  "irdaobex://",                // 0x1C
-  "file://",                    // 0x1D
-  "urn:epc:id:",                // 0x1E
-  "urn:epc:tag:",               // 0x1F
-  "urn:epc:pat:",               // 0x20
-  "urn:epc:raw:",               // 0x21
-  "urn:epc:",                   // 0x22
-  "urn:nfc:",                   // 0x23
+  "", "http://www.", "https://www.", "http://", "https://",
+  "tel:", "mailto:", "ftp://anonymous:anonymous@", "ftp://ftp.",
+  "ftps://", "sftp://", "smb://", "nfs://", "ftp://", "dav://",
+  "news:", "telnet://", "imap:", "rtsp://", "urn:", "pop:",
+  "sip:", "sips:", "tftp:", "btspp://", "btl2cap://", "btgoep://",
+  "tcpobex://", "irdaobex://", "file://", "urn:epc:id:", "urn:epc:tag:",
+  "urn:epc:pat:", "urn:epc:raw:", "urn:epc:", "urn:nfc:",
 };
 const uint8_t NUM_URI_PREFIXES = sizeof(URI_PREFIXES) / sizeof(URI_PREFIXES[0]);
 
-// Parse and print a single NDEF record from a buffer
-// Returns number of bytes consumed, or 0 on error
 uint16_t parseNdefRecord(uint8_t *buf, uint16_t bufLen, uint8_t recordNum) {
   if (bufLen < 3) return 0;
 
   uint8_t header = buf[0];
-  bool mb = header & 0x80;  // Message Begin
-  bool me = header & 0x40;  // Message End
-  bool cf = header & 0x20;  // Chunk Flag
-  bool sr = header & 0x10;  // Short Record
-  bool il = header & 0x08;  // ID Length present
-  uint8_t tnf = header & 0x07;  // Type Name Format
-
+  bool sr = header & 0x10;
+  bool il = header & 0x08;
+  uint8_t tnf = header & 0x07;
   uint8_t typeLen = buf[1];
   uint16_t offset = 2;
 
-  // Payload length: 1 byte if SR, 4 bytes otherwise
   uint32_t payloadLen;
   if (sr) {
     payloadLen = buf[offset++];
@@ -352,311 +341,583 @@ uint16_t parseNdefRecord(uint8_t *buf, uint16_t bufLen, uint8_t recordNum) {
     offset += 4;
   }
 
-  // ID length
-  uint8_t idLen = 0;
-  if (il) {
-    idLen = buf[offset++];
-  }
-
-  // Type
+  uint8_t idLen = il ? buf[offset++] : 0;
   uint8_t *type = buf + offset;
   offset += typeLen;
-
-  // ID (skip)
   offset += idLen;
-
-  // Payload
   uint8_t *payload = buf + offset;
-  if (offset + payloadLen > bufLen) {
-    payloadLen = bufLen - offset;  // truncate
-  }
+  if (offset + payloadLen > bufLen) payloadLen = bufLen - offset;
 
-  Serial.print("  Record #");
+  Serial.print("Record #");
   Serial.println(recordNum);
 
-  // TNF name
-  Serial.print("    TNF: ");
-  switch (tnf) {
-    case 0x00: Serial.println("Empty"); break;
-    case 0x01: Serial.println("NFC Forum well-known"); break;
-    case 0x02: Serial.println("Media type (RFC 2046)"); break;
-    case 0x03: Serial.println("Absolute URI"); break;
-    case 0x04: Serial.println("NFC Forum external"); break;
-    case 0x05: Serial.println("Unknown"); break;
-    case 0x06: Serial.println("Unchanged"); break;
-    default:   Serial.println("Reserved"); break;
-  }
+  Serial.print("  TNF: ");
+  const char *tnfNames[] = {"Empty","Well-known","Media","Absolute URI","External","Unknown","Unchanged","Reserved"};
+  Serial.println(tnfNames[tnf < 8 ? tnf : 7]);
 
-  // Print type
   if (typeLen > 0) {
-    Serial.print("    Type: ");
-    for (uint8_t i = 0; i < typeLen; i++) {
-      Serial.print((char)type[i]);
-    }
+    Serial.print("  Type: ");
+    for (uint8_t i = 0; i < typeLen; i++) Serial.print((char)type[i]);
     Serial.println();
   }
 
-  Serial.print("    Payload (");
-  Serial.print(payloadLen);
-  Serial.println(" bytes):");
-
-  // Decode well-known types
   if (tnf == 0x01 && typeLen == 1 && type[0] == 'U' && payloadLen >= 1) {
-    // URI record
-    uint8_t prefixCode = payload[0];
-    Serial.print("    URI: ");
-    if (prefixCode < NUM_URI_PREFIXES) {
-      Serial.print(URI_PREFIXES[prefixCode]);
-    }
-    for (uint32_t i = 1; i < payloadLen; i++) {
-      Serial.print((char)payload[i]);
-    }
+    uint8_t pc = payload[0];
+    Serial.print("  URI: ");
+    if (pc < NUM_URI_PREFIXES) Serial.print(URI_PREFIXES[pc]);
+    for (uint32_t i = 1; i < payloadLen; i++) Serial.print((char)payload[i]);
     Serial.println();
-
   } else if (tnf == 0x01 && typeLen == 1 && type[0] == 'T' && payloadLen >= 3) {
-    // Text record
-    uint8_t statusByte = payload[0];
-    uint8_t langLen = statusByte & 0x3F;
-    bool isUtf16 = statusByte & 0x80;
-
-    Serial.print("    Lang: ");
-    for (uint8_t i = 1; i <= langLen && i < payloadLen; i++) {
-      Serial.print((char)payload[i]);
-    }
+    uint8_t langLen = payload[0] & 0x3F;
+    Serial.print("  Lang: ");
+    for (uint8_t i = 1; i <= langLen && i < payloadLen; i++) Serial.print((char)payload[i]);
     Serial.println();
-
-    Serial.print("    Text: ");
-    if (!isUtf16) {
-      for (uint32_t i = 1 + langLen; i < payloadLen; i++) {
-        Serial.print((char)payload[i]);
-      }
-    } else {
-      Serial.print("(UTF-16 encoded, ");
-      Serial.print(payloadLen - 1 - langLen);
-      Serial.print(" bytes)");
-    }
+    Serial.print("  Text: ");
+    for (uint32_t i = 1 + langLen; i < payloadLen; i++) Serial.print((char)payload[i]);
     Serial.println();
-
-  } else if (tnf == 0x02) {
-    // Media type - print as string if ASCII
-    Serial.print("    Data: ");
-    for (uint32_t i = 0; i < payloadLen && i < 128; i++) {
-      Serial.print((payload[i] >= 0x20 && payload[i] <= 0x7E) ? (char)payload[i] : '.');
-    }
-    if (payloadLen > 128) Serial.print("...");
-    Serial.println();
-
   } else {
-    // Generic hex dump of payload (max 64 bytes)
-    Serial.print("    Hex: ");
+    Serial.print("  Data: ");
     for (uint32_t i = 0; i < payloadLen && i < 64; i++) {
-      printHex(payload[i]);
-      Serial.print(" ");
+      Serial.print((payload[i] >= 0x20 && payload[i] <= 0x7E) ? (char)payload[i] : '.');
     }
     if (payloadLen > 64) Serial.print("...");
     Serial.println();
   }
 
-  offset += payloadLen;
-  return offset;
+  return offset + payloadLen;
 }
 
-// Parse NDEF from Ultralight/NTAG TLV data (pages 4+)
-void parseNdefUltralight(void) {
-  // Read user data pages into a buffer (max ~200 pages x 4 bytes)
-  // NTAG213=36 user pages, NTAG215=126, NTAG216=222
-  uint8_t buf[232 * 4];
-  uint16_t bufLen = 0;
-
-  for (uint16_t page = 4; page < 232; page++) {
-    if (!nfc.mifareultralight_ReadPage(page, buf + bufLen)) {
-      break;
-    }
-    bufLen += 4;
-  }
-
-  if (bufLen == 0) {
-    Serial.println("  (Could not read NDEF data area)");
-    return;
-  }
-
-  Serial.println("  --- NDEF Records ---");
-
-  // Parse TLV blocks
+bool parseTlvNdef(uint8_t *buf, uint16_t bufLen) {
   uint16_t pos = 0;
-  bool foundNdef = false;
+  bool found = false;
   while (pos < bufLen) {
     uint8_t tlvType = buf[pos++];
-
-    if (tlvType == 0x00) {
-      continue;  // NULL TLV, skip
-    }
-    if (tlvType == 0xFE) {
-      break;  // Terminator TLV
-    }
-
-    // Read length (1 or 3 bytes)
+    if (tlvType == 0x00) continue;
+    if (tlvType == 0xFE) break;
     if (pos >= bufLen) break;
+
     uint16_t tlvLen;
     if (buf[pos] == 0xFF) {
       if (pos + 2 >= bufLen) break;
-      tlvLen = (buf[pos + 1] << 8) | buf[pos + 2];
+      tlvLen = (buf[pos+1] << 8) | buf[pos+2];
       pos += 3;
     } else {
       tlvLen = buf[pos++];
     }
 
     if (tlvType == 0x03) {
-      // NDEF Message TLV
-      foundNdef = true;
-      uint16_t ndefEnd = pos + tlvLen;
-      if (ndefEnd > bufLen) ndefEnd = bufLen;
-
-      uint8_t recordNum = 1;
-      uint16_t ndefPos = pos;
-      while (ndefPos < ndefEnd) {
-        uint16_t consumed = parseNdefRecord(buf + ndefPos, ndefEnd - ndefPos, recordNum);
-        if (consumed == 0) break;
-        ndefPos += consumed;
-        recordNum++;
+      found = true;
+      uint16_t end = pos + tlvLen;
+      if (end > bufLen) end = bufLen;
+      uint8_t recNum = 1;
+      uint16_t p = pos;
+      while (p < end) {
+        uint16_t c = parseNdefRecord(buf + p, end - p, recNum++);
+        if (c == 0) break;
+        p += c;
       }
-      pos = ndefEnd;
-    } else {
-      // Skip other TLV types
-      pos += tlvLen;
-    }
-  }
-
-  if (!foundNdef) {
-    Serial.println("  (No NDEF message found - tag may not be NDEF formatted)");
-  }
-}
-
-// Parse NDEF from MIFARE Classic (using MAD - MIFARE Application Directory)
-void parseNdefClassic(uint8_t *uid, uint8_t uidLen) {
-  // MAD is in sector 0, blocks 1-2
-  // First check if sector 0 uses MAD key A (A0:A1:A2:A3:A4:A5)
-  uint8_t madKeyA[6] = {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5};
-  uint8_t block1[16], block2[16];
-  bool hasMad = false;
-
-  // Try all known keys on sector 0 (block 0)
-  if (tryAuthBlock(uid, uidLen, 0, 0) >= 0) {
-    if (nfc.mifareclassic_ReadDataBlock(1, block1) &&
-        nfc.mifareclassic_ReadDataBlock(2, block2)) {
-      hasMad = true;
-    }
-  }
-
-  Serial.println("  --- NDEF Records ---");
-
-  if (!hasMad) {
-    Serial.println("  (Could not read MAD - no NDEF on this Classic tag)");
-    return;
-  }
-
-  // MAD entries: block1[0]=CRC, block1[1]=info, block1[2..15] = AID for sectors 1-7
-  // block2[0..15] = AID for sectors 8-15
-  // NDEF AID = 0x03E1
-
-  // Collect sectors that contain NDEF data
-  uint8_t ndefSectors[15];
-  uint8_t numNdefSectors = 0;
-
-  // MAD1 entries for sectors 1-15 (2 bytes each)
-  // block1 bytes 2-15 = sectors 1-7 (7 entries = 14 bytes)
-  for (uint8_t i = 0; i < 7; i++) {
-    uint16_t aid = (block1[2 + i * 2] << 8) | block1[2 + i * 2 + 1];
-    if (aid == 0x03E1) {
-      ndefSectors[numNdefSectors++] = i + 1;
-    }
-  }
-  // block2 bytes 0-15 = sectors 8-15 (8 entries = 16 bytes)
-  for (uint8_t i = 0; i < 8; i++) {
-    uint16_t aid = (block2[i * 2] << 8) | block2[i * 2 + 1];
-    if (aid == 0x03E1) {
-      ndefSectors[numNdefSectors++] = i + 8;
-    }
-  }
-
-  if (numNdefSectors == 0) {
-    Serial.println("  (MAD present but no NDEF application found)");
-    return;
-  }
-
-  // Read NDEF data from identified sectors
-  // NDEF key for data sectors is D3:F7:D3:F7:D3:F7
-  uint8_t ndefKey[6] = {0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7};
-  uint8_t ndefBuf[15 * 3 * 16];  // max 15 sectors x 3 data blocks x 16 bytes
-  uint16_t ndefLen = 0;
-
-  for (uint8_t s = 0; s < numNdefSectors; s++) {
-    uint8_t firstBlock = ndefSectors[s] * 4;
-    // Try all known keys on this sector
-    if (tryAuthBlock(uid, uidLen, firstBlock, 0) < 0) {
-      continue;
-    }
-    // Read 3 data blocks (skip trailer)
-    for (uint8_t b = 0; b < 3; b++) {
-      if (nfc.mifareclassic_ReadDataBlock(firstBlock + b, ndefBuf + ndefLen)) {
-        ndefLen += 16;
-      }
-    }
-  }
-
-  if (ndefLen == 0) {
-    Serial.println("  (Could not read NDEF sectors)");
-    return;
-  }
-
-  // Parse TLV in the NDEF data (same format as Ultralight)
-  uint16_t pos = 0;
-  bool foundNdef = false;
-  while (pos < ndefLen) {
-    uint8_t tlvType = ndefBuf[pos++];
-    if (tlvType == 0x00) continue;
-    if (tlvType == 0xFE) break;
-
-    if (pos >= ndefLen) break;
-    uint16_t tlvLen;
-    if (ndefBuf[pos] == 0xFF) {
-      if (pos + 2 >= ndefLen) break;
-      tlvLen = (ndefBuf[pos + 1] << 8) | ndefBuf[pos + 2];
-      pos += 3;
-    } else {
-      tlvLen = ndefBuf[pos++];
-    }
-
-    if (tlvType == 0x03) {
-      foundNdef = true;
-      uint16_t ndefEnd = pos + tlvLen;
-      if (ndefEnd > ndefLen) ndefEnd = ndefLen;
-
-      uint8_t recordNum = 1;
-      uint16_t ndefPos = pos;
-      while (ndefPos < ndefEnd) {
-        uint16_t consumed = parseNdefRecord(ndefBuf + ndefPos, ndefEnd - ndefPos, recordNum);
-        if (consumed == 0) break;
-        ndefPos += consumed;
-        recordNum++;
-      }
-      pos = ndefEnd;
+      pos = end;
     } else {
       pos += tlvLen;
     }
   }
+  return found;
+}
 
-  if (!foundNdef) {
-    Serial.println("  (No NDEF message in data sectors)");
+void cmdNdef() {
+  if (!hasTag) { Serial.println("No tag scanned. Run SCAN first."); return; }
+
+  Serial.println("Hold tag on reader...");
+  if (!reselectCard()) { Serial.println("Tag not present."); return; }
+
+  Serial.println("--- NDEF Records ---");
+
+  if (currentTag.type == TAG_MIFARE_ULTRALIGHT) {
+    uint8_t buf[232 * 4];
+    uint16_t bufLen = 0;
+    for (uint16_t page = 4; page < 232; page++) {
+      if (!nfc.mifareultralight_ReadPage(page, buf + bufLen)) break;
+      bufLen += 4;
+    }
+    if (bufLen == 0 || !parseTlvNdef(buf, bufLen)) {
+      Serial.println("No NDEF message found.");
+    }
+
+  } else if (currentTag.type == TAG_MIFARE_CLASSIC_1K || currentTag.type == TAG_MIFARE_CLASSIC_4K) {
+    // Read MAD from sector 0
+    if (tryAuthBlock(currentTag.uid, currentTag.uidLen, 0, 0) < 0) {
+      Serial.println("Cannot read MAD (auth failed on sector 0).");
+      return;
+    }
+    uint8_t block1[16], block2[16];
+    if (!nfc.mifareclassic_ReadDataBlock(1, block1) || !nfc.mifareclassic_ReadDataBlock(2, block2)) {
+      Serial.println("Cannot read MAD blocks.");
+      return;
+    }
+
+    // Find NDEF sectors (AID 0x03E1)
+    uint8_t ndefSectors[15];
+    uint8_t numNdef = 0;
+    for (uint8_t i = 0; i < 7; i++) {
+      uint16_t aid = (block1[2 + i*2] << 8) | block1[2 + i*2 + 1];
+      if (aid == 0x03E1) ndefSectors[numNdef++] = i + 1;
+    }
+    for (uint8_t i = 0; i < 8; i++) {
+      uint16_t aid = (block2[i*2] << 8) | block2[i*2 + 1];
+      if (aid == 0x03E1) ndefSectors[numNdef++] = i + 8;
+    }
+
+    if (numNdef == 0) { Serial.println("No NDEF application in MAD."); return; }
+
+    uint8_t ndefBuf[720];
+    uint16_t ndefLen = 0;
+    for (uint8_t s = 0; s < numNdef; s++) {
+      uint8_t fb = ndefSectors[s] * 4;
+      if (tryAuthBlock(currentTag.uid, currentTag.uidLen, fb, 0) < 0) continue;
+      for (uint8_t b = 0; b < 3; b++) {
+        if (nfc.mifareclassic_ReadDataBlock(fb + b, ndefBuf + ndefLen)) ndefLen += 16;
+      }
+    }
+
+    if (ndefLen == 0 || !parseTlvNdef(ndefBuf, ndefLen)) {
+      Serial.println("No NDEF message found.");
+    }
+  } else {
+    Serial.println("NDEF not supported for this tag type.");
   }
 }
+
+// ============================================================
+// Command: WRITE <URL|TEXT> <content>
+// ============================================================
+
+void cmdWrite(String args) {
+  if (!hasTag) { Serial.println("No tag scanned. Run SCAN first."); return; }
+
+  args.trim();
+  int spaceIdx = args.indexOf(' ');
+  if (spaceIdx < 0) {
+    Serial.println("Usage: WRITE URL <url>  or  WRITE TEXT <text>");
+    return;
+  }
+
+  String recordType = args.substring(0, spaceIdx);
+  String content = args.substring(spaceIdx + 1);
+  recordType.toUpperCase();
+
+  if (currentTag.type == TAG_MIFARE_ULTRALIGHT) {
+    // Write NDEF to Ultralight/NTAG
+    Serial.println("Hold tag on reader for write...");
+    if (!reselectCard()) { Serial.println("Tag not present."); return; }
+
+    if (recordType == "URL") {
+      // Build NDEF URI message in TLV format
+      // Determine URI prefix
+      uint8_t prefixCode = 0x00;
+      String uri = content;
+      if (uri.startsWith("https://www.")) { prefixCode = 0x02; uri = uri.substring(12); }
+      else if (uri.startsWith("http://www."))  { prefixCode = 0x01; uri = uri.substring(11); }
+      else if (uri.startsWith("https://"))     { prefixCode = 0x04; uri = uri.substring(8); }
+      else if (uri.startsWith("http://"))      { prefixCode = 0x03; uri = uri.substring(7); }
+      else if (uri.startsWith("tel:"))         { prefixCode = 0x05; uri = uri.substring(4); }
+      else if (uri.startsWith("mailto:"))      { prefixCode = 0x06; uri = uri.substring(7); }
+
+      uint8_t uriLen = uri.length();
+      uint8_t payloadLen = 1 + uriLen;  // prefix code + uri
+      uint8_t ndefRecordLen = 3 + payloadLen;  // header(1) + typeLen(1) + payloadLen(1) + type(1) + payload
+      // Actually: header(1) + typeLen(1) + payloadLen(1) + type(1) + payload = 4 + payloadLen
+      // NDEF record: [header=0xD1] [typeLen=1] [payloadLen] [type='U'] [prefixCode] [uri...]
+      // TLV: [0x03] [ndefLen] [ndef record] [0xFE]
+
+      uint8_t ndefMsg[255];
+      uint8_t pos = 0;
+      ndefMsg[pos++] = 0x03;           // NDEF TLV type
+      ndefMsg[pos++] = 4 + payloadLen; // NDEF TLV length
+      ndefMsg[pos++] = 0xD1;           // NDEF record header: MB|ME|SR, TNF=0x01
+      ndefMsg[pos++] = 0x01;           // Type length = 1
+      ndefMsg[pos++] = payloadLen;     // Payload length
+      ndefMsg[pos++] = 'U';            // Type = URI
+      ndefMsg[pos++] = prefixCode;     // URI prefix code
+      for (uint8_t i = 0; i < uriLen; i++) ndefMsg[pos++] = uri[i];
+      ndefMsg[pos++] = 0xFE;           // Terminator TLV
+
+      // Write page by page starting at page 4
+      uint8_t numPages = (pos + 3) / 4;
+      for (uint8_t p = 0; p < numPages; p++) {
+        uint8_t pageData[4] = {0, 0, 0, 0};
+        for (uint8_t b = 0; b < 4 && (p * 4 + b) < pos; b++) {
+          pageData[b] = ndefMsg[p * 4 + b];
+        }
+        if (!nfc.mifareultralight_WritePage(4 + p, pageData)) {
+          Serial.print("Write failed at page ");
+          Serial.println(4 + p);
+          return;
+        }
+      }
+      Serial.print("Written URL: ");
+      Serial.println(content);
+
+    } else if (recordType == "TEXT") {
+      uint8_t textLen = content.length();
+      uint8_t langLen = 2;  // "en"
+      uint8_t payloadLen = 1 + langLen + textLen;  // status + lang + text
+
+      uint8_t ndefMsg[255];
+      uint8_t pos = 0;
+      ndefMsg[pos++] = 0x03;
+      ndefMsg[pos++] = 4 + payloadLen;
+      ndefMsg[pos++] = 0xD1;           // MB|ME|SR, TNF=0x01
+      ndefMsg[pos++] = 0x01;           // Type length = 1
+      ndefMsg[pos++] = payloadLen;
+      ndefMsg[pos++] = 'T';            // Type = Text
+      ndefMsg[pos++] = langLen;         // Status byte: UTF-8, lang length
+      ndefMsg[pos++] = 'e';
+      ndefMsg[pos++] = 'n';
+      for (uint8_t i = 0; i < textLen; i++) ndefMsg[pos++] = content[i];
+      ndefMsg[pos++] = 0xFE;
+
+      uint8_t numPages = (pos + 3) / 4;
+      for (uint8_t p = 0; p < numPages; p++) {
+        uint8_t pageData[4] = {0, 0, 0, 0};
+        for (uint8_t b = 0; b < 4 && (p * 4 + b) < pos; b++) {
+          pageData[b] = ndefMsg[p * 4 + b];
+        }
+        if (!nfc.mifareultralight_WritePage(4 + p, pageData)) {
+          Serial.print("Write failed at page ");
+          Serial.println(4 + p);
+          return;
+        }
+      }
+      Serial.print("Written Text: ");
+      Serial.println(content);
+
+    } else {
+      Serial.println("Unknown record type. Use URL or TEXT.");
+    }
+
+  } else if (currentTag.type == TAG_MIFARE_CLASSIC_1K || currentTag.type == TAG_MIFARE_CLASSIC_4K) {
+    Serial.println("Hold tag on reader for write...");
+    if (!reselectCard()) { Serial.println("Tag not present."); return; }
+
+    if (recordType == "URL") {
+      // Use the library's built-in Classic NDEF URI writer
+      // Determine URI identifier
+      uint8_t uriId = 0x00;
+      char *uriStr = (char *)content.c_str();
+      if (content.startsWith("https://www.")) { uriId = 0x02; uriStr += 12; }
+      else if (content.startsWith("http://www."))  { uriId = 0x01; uriStr += 11; }
+      else if (content.startsWith("https://"))     { uriId = 0x04; uriStr += 8; }
+      else if (content.startsWith("http://"))      { uriId = 0x03; uriStr += 7; }
+
+      if (nfc.mifareclassic_WriteNDEFURI(1, uriId, uriStr)) {
+        Serial.print("Written URL to Classic sector 1: ");
+        Serial.println(content);
+      } else {
+        Serial.println("Write failed.");
+      }
+    } else {
+      Serial.println("Classic WRITE currently supports URL only.");
+    }
+  } else {
+    Serial.println("Write not supported for this tag type.");
+  }
+}
+
+// ============================================================
+// Command: CLONE READ / CLONE WRITE
+// ============================================================
+
+void cmdCloneRead() {
+  if (!hasTag) { Serial.println("No tag scanned. Run SCAN first."); return; }
+
+  Serial.println("Hold SOURCE tag on reader...");
+  if (!reselectCard()) { Serial.println("Tag not present."); return; }
+
+  cloneLen = 0;
+  cloneType = currentTag.type;
+  cloneUidLen = currentTag.uidLen;
+  memcpy(cloneUid, currentTag.uid, currentTag.uidLen);
+
+  if (currentTag.type == TAG_MIFARE_CLASSIC_1K || currentTag.type == TAG_MIFARE_CLASSIC_4K) {
+    uint16_t totalBlocks = (currentTag.type == TAG_MIFARE_CLASSIC_4K) ? 256 : 64;
+    for (uint16_t block = 0; block < totalBlocks; block++) {
+      uint16_t sectorFirst = (block < 128) ? (block - (block % 4)) : (block - (block % 16));
+      if (block == sectorFirst) {
+        bool auth = (tryAuthBlock(currentTag.uid, currentTag.uidLen, block, 0) >= 0);
+        if (!auth) auth = (tryAuthBlock(currentTag.uid, currentTag.uidLen, block, 1) >= 0);
+        if (!auth) {
+          // Fill unauthenticated blocks with zeros
+          uint16_t bInSec = (block < 128) ? 4 : 16;
+          for (uint16_t b = 0; b < bInSec && cloneLen + 16 <= sizeof(cloneBuf); b++) {
+            memset(cloneBuf + cloneLen, 0, 16);
+            cloneLen += 16;
+          }
+          block = sectorFirst + ((block < 128) ? 3 : 15);
+          continue;
+        }
+      }
+      if (cloneLen + 16 > sizeof(cloneBuf)) break;
+      if (!nfc.mifareclassic_ReadDataBlock(block, cloneBuf + cloneLen)) {
+        memset(cloneBuf + cloneLen, 0, 16);
+      }
+      cloneLen += 16;
+    }
+    Serial.print("Read ");
+    Serial.print(cloneLen / 16);
+    Serial.println(" blocks into clone buffer.");
+
+  } else if (currentTag.type == TAG_MIFARE_ULTRALIGHT) {
+    for (uint16_t page = 0; page < 231; page++) {
+      if (cloneLen + 4 > sizeof(cloneBuf)) break;
+      if (!nfc.mifareultralight_ReadPage(page, cloneBuf + cloneLen)) break;
+      cloneLen += 4;
+    }
+    Serial.print("Read ");
+    Serial.print(cloneLen / 4);
+    Serial.println(" pages into clone buffer.");
+  } else {
+    Serial.println("Clone not supported for this tag type.");
+    return;
+  }
+
+  Serial.print("Source UID: ");
+  printUid(cloneUid, cloneUidLen);
+  Serial.println();
+  Serial.println("Now place TARGET tag and run: CLONE WRITE");
+}
+
+void cmdCloneWrite() {
+  if (cloneLen == 0) { Serial.println("Clone buffer empty. Run CLONE READ first."); return; }
+
+  Serial.println("Place blank TARGET tag on reader...");
+  uint8_t uid[7];
+  uint8_t uidLen;
+  if (!nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen, 10000)) {
+    Serial.println("No tag found.");
+    return;
+  }
+
+  Serial.print("Target UID: ");
+  printUid(uid, uidLen);
+  Serial.println();
+
+  if (cloneType == TAG_MIFARE_CLASSIC_1K || cloneType == TAG_MIFARE_CLASSIC_4K) {
+    uint16_t totalBlocks = cloneLen / 16;
+    uint16_t written = 0;
+    for (uint16_t block = 0; block < totalBlocks; block++) {
+      // Skip block 0 (manufacturer block, read-only)
+      if (block == 0) continue;
+      // Skip sector trailer blocks (they contain keys + access bits)
+      bool isTrailer;
+      if (block < 128) {
+        isTrailer = ((block + 1) % 4 == 0);
+      } else {
+        isTrailer = ((block + 1) % 16 == 0);
+      }
+      if (isTrailer) continue;
+
+      uint16_t sectorFirst = (block < 128) ? (block - (block % 4)) : (block - (block % 16));
+      if (block == sectorFirst || (block == 1)) {  // re-auth at sector boundary
+        bool auth = false;
+        // Try default key on target
+        if (nfc.mifareclassic_AuthenticateBlock(uid, uidLen, block, 0, (uint8_t *)KNOWN_KEYS[0])) {
+          auth = true;
+        } else {
+          reselectCard();
+          auth = (tryAuthBlock(uid, uidLen, block, 0) >= 0);
+        }
+        if (!auth) {
+          Serial.print("Auth failed on target block ");
+          Serial.println(block);
+          uint16_t bInSec = (block < 128) ? 4 : 16;
+          block = sectorFirst + bInSec - 1;
+          continue;
+        }
+      }
+
+      if (nfc.mifareclassic_WriteDataBlock(block, cloneBuf + block * 16)) {
+        written++;
+      } else {
+        Serial.print("Write failed at block ");
+        Serial.println(block);
+      }
+    }
+    Serial.print("Cloned ");
+    Serial.print(written);
+    Serial.println(" data blocks to target.");
+
+  } else if (cloneType == TAG_MIFARE_ULTRALIGHT) {
+    uint16_t totalPages = cloneLen / 4;
+    uint16_t written = 0;
+    // Skip pages 0-3 (UID + internal + lock + CC) — start at page 4
+    for (uint16_t page = 4; page < totalPages; page++) {
+      if (nfc.mifareultralight_WritePage(page, cloneBuf + page * 4)) {
+        written++;
+      } else {
+        Serial.print("Write failed at page ");
+        Serial.print(page);
+        Serial.println(" (may be config/lock page)");
+        break;
+      }
+    }
+    Serial.print("Cloned ");
+    Serial.print(written);
+    Serial.println(" pages to target.");
+  }
+}
+
+// ============================================================
+// Command: EMULATE
+// ============================================================
+
+void cmdEmulate() {
+  Serial.println("Entering card emulation mode...");
+  Serial.println("The PN532 will appear as an NFC tag.");
+  Serial.println("Bring a phone close to read it. Press any key to stop.");
+  Serial.println();
+
+  // Use the library's built-in AsTarget
+  // It emulates a basic ISO14443A target
+  while (!Serial.available()) {
+    uint8_t result = nfc.AsTarget();
+    if (result) {
+      Serial.println("Activated by reader!");
+
+      uint8_t cmd[64];
+      uint8_t cmdLen;
+
+      if (nfc.getDataTarget(cmd, &cmdLen)) {
+        Serial.print("Received (");
+        Serial.print(cmdLen);
+        Serial.print(" bytes): ");
+        for (uint8_t i = 0; i < cmdLen; i++) {
+          printHex(cmd[i]);
+          Serial.print(" ");
+        }
+        Serial.println();
+
+        // Respond with a simple NDEF message if this is an NDEF read
+        // Basic response: just echo back for now
+        uint8_t resp[] = {0x8E, 0x00};  // TgSetData success
+        nfc.setDataTarget(resp, sizeof(resp));
+      }
+    }
+    delay(100);
+  }
+  // Flush serial
+  while (Serial.available()) Serial.read();
+  Serial.println("Emulation stopped.");
+}
+
+// ============================================================
+// Command: SCANALL (multi-protocol)
+// ============================================================
+
+void cmdScanAll() {
+  Serial.println("Scanning all protocols (10s timeout)...");
+  Serial.println();
+
+  // ISO 14443A
+  Serial.println("[ISO 14443A]");
+  uint8_t uid[7];
+  uint8_t uidLen;
+  if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen, 3000)) {
+    uint16_t atqa = (pn532_packetbuffer[9] << 8) | pn532_packetbuffer[10];
+    uint8_t sak = pn532_packetbuffer[11];
+    currentTag = identifyTag(atqa, sak, uid, uidLen);
+    hasTag = true;
+
+    Serial.print("  Found: ");
+    Serial.println(currentTag.name);
+    Serial.print("  UID: ");
+    printUid(uid, uidLen);
+    Serial.println();
+    Serial.print("  ATQA: 0x");
+    if (atqa < 0x1000) Serial.print("0");
+    if (atqa < 0x100) Serial.print("0");
+    if (atqa < 0x10) Serial.print("0");
+    Serial.print(atqa, HEX);
+    Serial.print("  SAK: 0x");
+    printHex(sak);
+    Serial.println();
+  } else {
+    Serial.println("  No ISO 14443A tag found.");
+  }
+
+  // ISO 14443B — baud rate 0x03
+  // Note: library's InListPassiveTarget doesn't send AFI byte needed for 14443B,
+  // so detection may not work for all 14443B tags
+  Serial.println("[ISO 14443B]");
+  {
+    uint8_t uid14b[7];
+    uint8_t uid14bLen;
+    if (nfc.readPassiveTargetID(0x03, uid14b, &uid14bLen, 3000)) {
+      Serial.print("  Found ISO 14443B! ID: ");
+      printUid(uid14b, uid14bLen);
+      Serial.println();
+    } else {
+      Serial.println("  No ISO 14443B tag found.");
+    }
+  }
+
+  // FeliCa — baud rate 0x01 (212 kbps)
+  // Note: library doesn't send FeliCa polling payload, so detection is limited
+  Serial.println("[FeliCa (212 kbps)]");
+  {
+    uint8_t uidFe[7];
+    uint8_t uidFeLen;
+    if (nfc.readPassiveTargetID(0x01, uidFe, &uidFeLen, 3000)) {
+      Serial.print("  Found FeliCa! ID: ");
+      printUid(uidFe, uidFeLen);
+      Serial.println();
+    } else {
+      Serial.println("  No FeliCa tag found.");
+    }
+  }
+}
+
+// ============================================================
+// Command: HELP
+// ============================================================
+
+void cmdHelp() {
+  Serial.println("--- PN532 NFC Multi-Tool ---");
+  Serial.println("Commands:");
+  Serial.println("  SCAN       - Scan for an ISO 14443A tag");
+  Serial.println("  SCANALL    - Scan ISO 14443A + 14443B + FeliCa");
+  Serial.println("  DUMP       - Dump tag memory (after SCAN)");
+  Serial.println("  KEYS       - Audit MIFARE Classic keys (after SCAN)");
+  Serial.println("  NDEF       - Parse NDEF records (after SCAN)");
+  Serial.println("  WRITE URL <url>   - Write URL to tag");
+  Serial.println("  WRITE TEXT <text>  - Write text to tag");
+  Serial.println("  CLONE READ   - Read tag data into clone buffer");
+  Serial.println("  CLONE WRITE  - Write clone buffer to blank tag");
+  Serial.println("  EMULATE    - Enter card emulation mode");
+  Serial.println("  HELP       - Show this help");
+  Serial.println();
+  if (hasTag) {
+    Serial.print("Current tag: ");
+    Serial.print(currentTag.name);
+    Serial.print(" (");
+    printUid(currentTag.uid, currentTag.uidLen);
+    Serial.println(")");
+  } else {
+    Serial.println("No tag scanned yet.");
+  }
+}
+
+// ============================================================
+// Setup & Loop
+// ============================================================
+
+String serialBuffer = "";
 
 void setup() {
   Serial.begin(115200);
   while (!Serial) delay(10);
 
-  Serial.println("\nPN532 NFC Multi-Tool");
-  Serial.println("====================");
+  Serial.println("\nPN532 NFC Multi-Tool v2");
+  Serial.println("=======================");
 
   nfc.begin();
 
@@ -676,59 +937,55 @@ void setup() {
   nfc.SAMConfig();
   nfc.setPassiveActivationRetries(0xFF);
 
-  Serial.println("Ready. Scan a tag...\n");
+  Serial.println("Type HELP for commands.\n");
+  Serial.print("> ");
 }
 
 void loop() {
-  uint8_t uid[7];
-  uint8_t uidLength;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (serialBuffer.length() > 0) {
+        Serial.println();
 
-  if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 1000)) {
-    uint16_t atqa = (pn532_packetbuffer[9] << 8) | pn532_packetbuffer[10];
-    uint8_t sak = pn532_packetbuffer[11];
+        // Parse command
+        String cmd = serialBuffer;
+        cmd.trim();
+        String upper = cmd;
+        upper.toUpperCase();
 
-    TagInfo tag = identifyTag(atqa, sak, uidLength);
+        if (upper == "HELP" || upper == "?") {
+          cmdHelp();
+        } else if (upper == "SCAN") {
+          cmdScan();
+        } else if (upper == "SCANALL") {
+          cmdScanAll();
+        } else if (upper == "DUMP") {
+          cmdDump();
+        } else if (upper == "KEYS") {
+          cmdKeys();
+        } else if (upper == "NDEF") {
+          cmdNdef();
+        } else if (upper.startsWith("WRITE ")) {
+          cmdWrite(cmd.substring(6));
+        } else if (upper == "CLONE READ") {
+          cmdCloneRead();
+        } else if (upper == "CLONE WRITE") {
+          cmdCloneWrite();
+        } else if (upper == "EMULATE") {
+          cmdEmulate();
+        } else {
+          Serial.print("Unknown command: ");
+          Serial.println(cmd);
+          Serial.println("Type HELP for available commands.");
+        }
 
-    // Tag type
-    Serial.print("Tag: ");
-    Serial.println(tag.name);
-
-    // UID
-    Serial.print("  UID (");
-    Serial.print(uidLength);
-    Serial.print("): ");
-    for (uint8_t i = 0; i < uidLength; i++) {
-      printHex(uid[i]);
-      if (i < uidLength - 1) Serial.print(":");
-    }
-    Serial.println();
-
-    // Raw ATQA + SAK
-    Serial.print("  ATQA: 0x");
-    if (atqa < 0x1000) Serial.print("0");
-    if (atqa < 0x100) Serial.print("0");
-    if (atqa < 0x10) Serial.print("0");
-    Serial.print(atqa, HEX);
-    Serial.print("  SAK: 0x");
-    printHex(sak);
-    Serial.println();
-
-    // Memory dump, key audit, and NDEF parsing based on tag type
-    if (tag.type == TAG_MIFARE_CLASSIC_1K || tag.type == TAG_MIFARE_CLASSIC_4K) {
-      dumpMifareClassic(uid, uidLength, tag.type);
-      Serial.println();
-      testClassicKeys(uid, uidLength, tag.type);
-      Serial.println();
-      parseNdefClassic(uid, uidLength);
-    } else if (tag.type == TAG_MIFARE_ULTRALIGHT) {
-      dumpUltralight();
-      Serial.println();
-      parseNdefUltralight();
+        serialBuffer = "";
+        Serial.print("\n> ");
+      }
     } else {
-      Serial.println("  (Memory dump not supported for this tag type)");
+      serialBuffer += c;
+      Serial.print(c);  // echo
     }
-
-    Serial.println();
-    delay(2000);
   }
 }
