@@ -81,6 +81,113 @@ void printHex(uint8_t val) {
   Serial.print(val, HEX);
 }
 
+// Default key for MIFARE Classic authentication
+uint8_t defaultKey[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+// Dump MIFARE Classic 1K: 16 sectors, 4 blocks each (64 blocks total)
+// Classic 4K: 32 sectors x 4 blocks + 8 sectors x 16 blocks (256 blocks total)
+void dumpMifareClassic(uint8_t *uid, uint8_t uidLen, TagType type) {
+  uint8_t totalBlocks = (type == TAG_MIFARE_CLASSIC_4K) ? 256 : 64;
+  uint8_t data[16];
+
+  Serial.println("  --- MIFARE Classic Memory Dump ---");
+  Serial.println("  Blk | Data                                          | ASCII");
+  Serial.println("  ----+--------------------------------------------------+------------------");
+
+  for (uint8_t block = 0; block < totalBlocks; block++) {
+    // Authenticate at the start of each sector
+    // Classic 1K/Mini: 4 blocks per sector
+    // Classic 4K: 4 blocks per sector for first 32, 16 blocks per sector after
+    uint8_t sectorFirstBlock;
+    if (block < 128) {
+      sectorFirstBlock = block - (block % 4);
+    } else {
+      sectorFirstBlock = block - (block % 16);
+    }
+
+    if (block == sectorFirstBlock) {
+      if (!nfc.mifareclassic_AuthenticateBlock(uid, uidLen, block, 0, defaultKey)) {
+        // Print the sector as unreadable
+        uint8_t blocksInSector = (block < 128) ? 4 : 16;
+        for (uint8_t b = 0; b < blocksInSector && (block + b) < totalBlocks; b++) {
+          Serial.print("  ");
+          if ((block + b) < 10) Serial.print(" ");
+          if ((block + b) < 100) Serial.print(" ");
+          Serial.print(block + b);
+          Serial.println(" | AUTH FAILED (key FF..FF)                         |");
+        }
+        block = sectorFirstBlock + ((block < 128) ? 3 : 15);
+        continue;
+      }
+    }
+
+    if (nfc.mifareclassic_ReadDataBlock(block, data)) {
+      // Block number
+      Serial.print("  ");
+      if (block < 10) Serial.print(" ");
+      if (block < 100) Serial.print(" ");
+      Serial.print(block);
+      Serial.print(" | ");
+
+      // Hex
+      for (uint8_t i = 0; i < 16; i++) {
+        printHex(data[i]);
+        Serial.print(" ");
+      }
+      Serial.print("| ");
+
+      // ASCII
+      for (uint8_t i = 0; i < 16; i++) {
+        Serial.print((data[i] >= 0x20 && data[i] <= 0x7E) ? (char)data[i] : '.');
+      }
+      Serial.println();
+    } else {
+      Serial.print("  ");
+      if (block < 10) Serial.print(" ");
+      if (block < 100) Serial.print(" ");
+      Serial.print(block);
+      Serial.println(" | READ ERROR                                        |");
+    }
+  }
+}
+
+// Dump MIFARE Ultralight / NTAG: 4 bytes per page
+// Ultralight: 16 pages, Ultralight C: 48 pages, NTAG213: 45, NTAG215: 135, NTAG216: 231
+// We read until we get a failure, which indicates end of memory
+void dumpUltralight(void) {
+  uint8_t data[4];
+
+  Serial.println("  --- Ultralight / NTAG Memory Dump ---");
+  Serial.println("  Page | Data        | ASCII");
+  Serial.println("  -----+-------------+------");
+
+  for (uint8_t page = 0; page < 231; page++) {
+    if (!nfc.mifareultralight_ReadPage(page, data)) {
+      break;
+    }
+
+    // Page number
+    Serial.print("  ");
+    if (page < 10) Serial.print(" ");
+    if (page < 100) Serial.print(" ");
+    Serial.print(page);
+    Serial.print("  | ");
+
+    // Hex
+    for (uint8_t i = 0; i < 4; i++) {
+      printHex(data[i]);
+      Serial.print(" ");
+    }
+    Serial.print("| ");
+
+    // ASCII
+    for (uint8_t i = 0; i < 4; i++) {
+      Serial.print((data[i] >= 0x20 && data[i] <= 0x7E) ? (char)data[i] : '.');
+    }
+    Serial.println();
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   while (!Serial) delay(10);
@@ -143,7 +250,16 @@ void loop() {
     printHex(sak);
     Serial.println();
 
+    // Memory dump based on tag type
+    if (tag.type == TAG_MIFARE_CLASSIC_1K || tag.type == TAG_MIFARE_CLASSIC_4K) {
+      dumpMifareClassic(uid, uidLength, tag.type);
+    } else if (tag.type == TAG_MIFARE_ULTRALIGHT) {
+      dumpUltralight();
+    } else {
+      Serial.println("  (Memory dump not supported for this tag type)");
+    }
+
     Serial.println();
-    delay(1500);
+    delay(2000);
   }
 }
