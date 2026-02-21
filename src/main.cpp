@@ -184,15 +184,23 @@ void dumpMifareClassic(uint8_t *uid, uint8_t uidLen, TagType type) {
     }
 
     if (block == sectorFirstBlock) {
-      if (!nfc.mifareclassic_AuthenticateBlock(uid, uidLen, block, 0, (uint8_t *)KNOWN_KEYS[0])) {
-        // Print the sector as unreadable
+      // Try all known keys (A and B) until one works
+      bool authenticated = false;
+      for (uint8_t k = 0; k < NUM_KNOWN_KEYS && !authenticated; k++) {
+        if (nfc.mifareclassic_AuthenticateBlock(uid, uidLen, block, 0, (uint8_t *)KNOWN_KEYS[k])) {
+          authenticated = true;
+        } else if (nfc.mifareclassic_AuthenticateBlock(uid, uidLen, block, 1, (uint8_t *)KNOWN_KEYS[k])) {
+          authenticated = true;
+        }
+      }
+      if (!authenticated) {
         uint8_t blocksInSector = (block < 128) ? 4 : 16;
         for (uint8_t b = 0; b < blocksInSector && (block + b) < totalBlocks; b++) {
           Serial.print("  ");
           if ((block + b) < 10) Serial.print(" ");
           if ((block + b) < 100) Serial.print(" ");
           Serial.print(block + b);
-          Serial.println(" | AUTH FAILED (key FF..FF)                         |");
+          Serial.println(" | AUTH FAILED (no known key)                       |");
         }
         block = sectorFirstBlock + ((block < 128) ? 3 : 15);
         continue;
