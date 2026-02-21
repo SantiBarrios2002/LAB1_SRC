@@ -81,6 +81,27 @@ void printHex(uint8_t val) {
   Serial.print(val, HEX);
 }
 
+// Re-select the card after a failed auth (card goes to HALT state)
+bool reselectCard(void) {
+  uint8_t uid[7];
+  uint8_t uidLen;
+  return nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen, 500);
+}
+
+// Try to authenticate a block with all known keys, re-selecting after each failure.
+// Returns the key index that worked, or -1 if none matched.
+// keyType: 0 = Key A, 1 = Key B
+int8_t tryAuthBlock(uint8_t *uid, uint8_t uidLen, uint8_t block, uint8_t keyType) {
+  for (uint8_t k = 0; k < NUM_KNOWN_KEYS; k++) {
+    if (nfc.mifareclassic_AuthenticateBlock(uid, uidLen, block, keyType, (uint8_t *)KNOWN_KEYS[k])) {
+      return k;
+    }
+    // Card is now halted, re-select before trying next key
+    reselectCard();
+  }
+  return -1;
+}
+
 // Common MIFARE Classic keys found in the wild
 const uint8_t KNOWN_KEYS[][6] = {
   {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},  // Factory default
@@ -119,38 +140,28 @@ void testClassicKeys(uint8_t *uid, uint8_t uidLen, TagType type) {
     Serial.print("  | ");
 
     // Try Key A (type 0)
-    bool foundA = false;
-    for (uint8_t k = 0; k < NUM_KNOWN_KEYS; k++) {
-      if (nfc.mifareclassic_AuthenticateBlock(uid, uidLen, firstBlock, 0, (uint8_t *)KNOWN_KEYS[k])) {
-        foundA = true;
-        for (uint8_t i = 0; i < 6; i++) {
-          printHex(KNOWN_KEYS[k][i]);
-          if (i < 5) Serial.print(":");
-        }
-        Serial.print(" (A)");
-        break;
+    int8_t keyA = tryAuthBlock(uid, uidLen, firstBlock, 0);
+    if (keyA >= 0) {
+      for (uint8_t i = 0; i < 6; i++) {
+        printHex(KNOWN_KEYS[keyA][i]);
+        if (i < 5) Serial.print(":");
       }
-    }
-    if (!foundA) {
+      Serial.print(" (A)");
+    } else {
       Serial.print("-- none matched --    ");
     }
 
     Serial.print(" | ");
 
     // Try Key B (type 1)
-    bool foundB = false;
-    for (uint8_t k = 0; k < NUM_KNOWN_KEYS; k++) {
-      if (nfc.mifareclassic_AuthenticateBlock(uid, uidLen, firstBlock, 1, (uint8_t *)KNOWN_KEYS[k])) {
-        foundB = true;
-        for (uint8_t i = 0; i < 6; i++) {
-          printHex(KNOWN_KEYS[k][i]);
-          if (i < 5) Serial.print(":");
-        }
-        Serial.print(" (B)");
-        break;
+    int8_t keyB = tryAuthBlock(uid, uidLen, firstBlock, 1);
+    if (keyB >= 0) {
+      for (uint8_t i = 0; i < 6; i++) {
+        printHex(KNOWN_KEYS[keyB][i]);
+        if (i < 5) Serial.print(":");
       }
-    }
-    if (!foundB) {
+      Serial.print(" (B)");
+    } else {
       Serial.print("-- none matched --");
     }
 
@@ -184,14 +195,10 @@ void dumpMifareClassic(uint8_t *uid, uint8_t uidLen, TagType type) {
     }
 
     if (block == sectorFirstBlock) {
-      // Try all known keys (A and B) until one works
-      bool authenticated = false;
-      for (uint8_t k = 0; k < NUM_KNOWN_KEYS && !authenticated; k++) {
-        if (nfc.mifareclassic_AuthenticateBlock(uid, uidLen, block, 0, (uint8_t *)KNOWN_KEYS[k])) {
-          authenticated = true;
-        } else if (nfc.mifareclassic_AuthenticateBlock(uid, uidLen, block, 1, (uint8_t *)KNOWN_KEYS[k])) {
-          authenticated = true;
-        }
+      // Try all known keys with re-select between failures
+      bool authenticated = (tryAuthBlock(uid, uidLen, block, 0) >= 0);
+      if (!authenticated) {
+        authenticated = (tryAuthBlock(uid, uidLen, block, 1) >= 0);
       }
       if (!authenticated) {
         uint8_t blocksInSector = (block < 128) ? 4 : 16;
@@ -534,9 +541,8 @@ void parseNdefClassic(uint8_t *uid, uint8_t uidLen) {
   uint8_t block1[16], block2[16];
   bool hasMad = false;
 
-  // Try MAD key first, then default key
-  if (nfc.mifareclassic_AuthenticateBlock(uid, uidLen, 1, 0, madKeyA) ||
-      nfc.mifareclassic_AuthenticateBlock(uid, uidLen, 1, 0, (uint8_t *)KNOWN_KEYS[0])) {
+  // Try all known keys on sector 0 (block 0)
+  if (tryAuthBlock(uid, uidLen, 0, 0) >= 0) {
     if (nfc.mifareclassic_ReadDataBlock(1, block1) &&
         nfc.mifareclassic_ReadDataBlock(2, block2)) {
       hasMad = true;
@@ -587,9 +593,8 @@ void parseNdefClassic(uint8_t *uid, uint8_t uidLen) {
 
   for (uint8_t s = 0; s < numNdefSectors; s++) {
     uint8_t firstBlock = ndefSectors[s] * 4;
-    // Try NDEF key, then default
-    if (!nfc.mifareclassic_AuthenticateBlock(uid, uidLen, firstBlock, 0, ndefKey) &&
-        !nfc.mifareclassic_AuthenticateBlock(uid, uidLen, firstBlock, 0, (uint8_t *)KNOWN_KEYS[0])) {
+    // Try all known keys on this sector
+    if (tryAuthBlock(uid, uidLen, firstBlock, 0) < 0) {
       continue;
     }
     // Read 3 data blocks (skip trailer)
