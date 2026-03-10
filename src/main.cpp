@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <Adafruit_PN532.h>
+#include <mbedtls/des.h>
 
 // ESP32 DevKit Hardware SPI pins for PN532
 #define PN532_SS   5   // Chip Select (CS)
@@ -651,6 +652,716 @@ void parseNdefClassic(uint8_t *uid, uint8_t uidLen) {
   }
 }
 
+// ============================================================
+// Serial helpers
+// ============================================================
+
+// Read a line from Serial with timeout (ms). Returns length, 0 on timeout.
+uint8_t readSerialLine(char *buf, uint8_t maxLen, uint32_t timeoutMs) {
+  uint32_t start = millis();
+  uint8_t idx = 0;
+  while (millis() - start < timeoutMs) {
+    if (Serial.available()) {
+      char c = Serial.read();
+      if (c == '\n' || c == '\r') {
+        if (idx > 0) break;
+        continue;
+      }
+      if (idx < maxLen - 1) {
+        buf[idx++] = c;
+      }
+    }
+  }
+  buf[idx] = '\0';
+  return idx;
+}
+
+// Read an integer from Serial with a prompt. Returns -1 on timeout/invalid.
+int readSerialInt(const char *prompt, uint32_t timeoutMs) {
+  Serial.print(prompt);
+  char buf[16];
+  if (readSerialLine(buf, sizeof(buf), timeoutMs) == 0) return -1;
+  Serial.println(buf);
+  return atoi(buf);
+}
+
+// Parse a hex byte string like "FF" into a byte. Returns -1 if invalid.
+int parseHexByte(const char *s) {
+  if (strlen(s) < 2) return -1;
+  char hi = toupper(s[0]), lo = toupper(s[1]);
+  int val = 0;
+  if (hi >= '0' && hi <= '9') val = (hi - '0') << 4;
+  else if (hi >= 'A' && hi <= 'F') val = (hi - 'A' + 10) << 4;
+  else return -1;
+  if (lo >= '0' && lo <= '9') val |= (lo - '0');
+  else if (lo >= 'A' && lo <= 'F') val |= (lo - 'A' + 10);
+  else return -1;
+  return val;
+}
+
+// ============================================================
+// Feature 1: Write data to a MIFARE Classic block (exercise 4)
+// ============================================================
+
+void cmdWriteClassicBlock(uint8_t *uid, uint8_t uidLen) {
+  Serial.println("\n  == Write Data to MIFARE Classic Block ==");
+
+  int block = readSerialInt("  Block number (0-63): ", 30000);
+  if (block < 0 || block > 255) {
+    Serial.println("  Cancelled.");
+    return;
+  }
+
+  // Warn about trailer blocks
+  uint8_t posInSector = (block < 128) ? (block % 4) : (block % 16);
+  uint8_t blocksInSector = (block < 128) ? 4 : 16;
+  if (posInSector == blocksInSector - 1) {
+    Serial.println("  WARNING: This is a sector trailer! Writing here changes keys/access bits.");
+    Serial.print("  Are you sure? (y/n): ");
+    char confirm[4];
+    readSerialLine(confirm, sizeof(confirm), 15000);
+    Serial.println(confirm);
+    if (confirm[0] != 'y' && confirm[0] != 'Y') {
+      Serial.println("  Cancelled.");
+      return;
+    }
+  }
+
+  Serial.println("  Enter 16 bytes as hex (e.g. 30 31 32 33 34 35 36 37 38 39 30 31 32 33 34 35):");
+  Serial.print("  > ");
+  char hexInput[80];
+  if (readSerialLine(hexInput, sizeof(hexInput), 60000) == 0) {
+    Serial.println("  Cancelled (timeout).");
+    return;
+  }
+  Serial.println(hexInput);
+
+  // Parse hex bytes
+  uint8_t data[16];
+  memset(data, 0, 16);
+  uint8_t byteCount = 0;
+  char *tok = strtok(hexInput, " ,:");
+  while (tok && byteCount < 16) {
+    int val = parseHexByte(tok);
+    if (val < 0) {
+      Serial.print("  Invalid hex byte: ");
+      Serial.println(tok);
+      return;
+    }
+    data[byteCount++] = (uint8_t)val;
+    tok = strtok(NULL, " ,:");
+  }
+  if (byteCount < 16) {
+    Serial.print("  Only ");
+    Serial.print(byteCount);
+    Serial.println(" bytes entered, padding rest with 0x00.");
+  }
+
+  // Authenticate
+  Serial.println("  Authenticating...");
+  if (tryAuthBlock(uid, uidLen, block, 0) < 0 &&
+      tryAuthBlock(uid, uidLen, block, 1) < 0) {
+    Serial.println("  AUTH FAILED - cannot write.");
+    return;
+  }
+
+  // Write
+  if (nfc.mifareclassic_WriteDataBlock(block, data)) {
+    Serial.print("  Block ");
+    Serial.print(block);
+    Serial.println(" written OK.");
+
+    // Read back to verify
+    uint8_t readback[16];
+    if (nfc.mifareclassic_ReadDataBlock(block, readback)) {
+      Serial.print("  Verify: ");
+      for (uint8_t i = 0; i < 16; i++) {
+        printHex(readback[i]);
+        Serial.print(" ");
+      }
+      Serial.println();
+    }
+  } else {
+    Serial.println("  WRITE FAILED.");
+  }
+}
+
+// ============================================================
+// Feature 2: Change Key A on a sector (exercise 5)
+// ============================================================
+
+void cmdChangeKey(uint8_t *uid, uint8_t uidLen) {
+  Serial.println("\n  == Change Key A for a Sector ==");
+
+  int sector = readSerialInt("  Sector number (0-15): ", 30000);
+  if (sector < 0 || sector > 15) {
+    Serial.println("  Cancelled.");
+    return;
+  }
+
+  uint8_t trailerBlock = sector * 4 + 3;
+
+  // Authenticate trailer block
+  Serial.println("  Authenticating sector trailer...");
+  int8_t authKey = tryAuthBlock(uid, uidLen, trailerBlock, 0);
+  if (authKey < 0) {
+    authKey = tryAuthBlock(uid, uidLen, trailerBlock, 1);
+    if (authKey < 0) {
+      Serial.println("  AUTH FAILED - cannot access trailer.");
+      return;
+    }
+  }
+
+  // Read current trailer
+  uint8_t trailer[16];
+  if (!nfc.mifareclassic_ReadDataBlock(trailerBlock, trailer)) {
+    Serial.println("  Failed to read sector trailer.");
+    return;
+  }
+
+  Serial.print("  Current trailer: ");
+  for (uint8_t i = 0; i < 16; i++) {
+    printHex(trailer[i]);
+    Serial.print(" ");
+  }
+  Serial.println();
+  Serial.println("  [bytes 0-5: KeyA | 6-9: Access bits | 10-15: KeyB]");
+
+  Serial.println("  Enter new Key A (6 hex bytes, e.g. 0F 0F 0F 0F 0F 0F):");
+  Serial.print("  > ");
+  char hexInput[40];
+  if (readSerialLine(hexInput, sizeof(hexInput), 60000) == 0) {
+    Serial.println("  Cancelled.");
+    return;
+  }
+  Serial.println(hexInput);
+
+  uint8_t newKey[6];
+  uint8_t byteCount = 0;
+  char *tok = strtok(hexInput, " ,:");
+  while (tok && byteCount < 6) {
+    int val = parseHexByte(tok);
+    if (val < 0) {
+      Serial.print("  Invalid hex: ");
+      Serial.println(tok);
+      return;
+    }
+    newKey[byteCount++] = (uint8_t)val;
+    tok = strtok(NULL, " ,:");
+  }
+  if (byteCount != 6) {
+    Serial.println("  Need exactly 6 bytes for Key A.");
+    return;
+  }
+
+  // Replace Key A (bytes 0-5), keep access bits (6-9) and Key B (10-15) unchanged
+  memcpy(trailer, newKey, 6);
+
+  Serial.print("  New trailer to write: ");
+  for (uint8_t i = 0; i < 16; i++) {
+    printHex(trailer[i]);
+    Serial.print(" ");
+  }
+  Serial.println();
+
+  Serial.print("  Confirm write? (y/n): ");
+  char confirm[4];
+  readSerialLine(confirm, sizeof(confirm), 15000);
+  Serial.println(confirm);
+  if (confirm[0] != 'y' && confirm[0] != 'Y') {
+    Serial.println("  Cancelled.");
+    return;
+  }
+
+  // Re-auth since reading may have changed state
+  reselectCard();
+  if (tryAuthBlock(uid, uidLen, trailerBlock, 0) < 0 &&
+      tryAuthBlock(uid, uidLen, trailerBlock, 1) < 0) {
+    Serial.println("  Re-auth failed.");
+    return;
+  }
+
+  if (nfc.mifareclassic_WriteDataBlock(trailerBlock, trailer)) {
+    Serial.print("  Sector ");
+    Serial.print(sector);
+    Serial.println(" Key A changed OK.");
+    Serial.println("  IMPORTANT: Remember the new key or the sector becomes inaccessible!");
+  } else {
+    Serial.println("  WRITE FAILED.");
+  }
+}
+
+// ============================================================
+// Feature 3: Change access conditions on a sector (exercise 8)
+// ============================================================
+
+// Encode access bits for a single block. C1, C2, C3 are each 0 or 1.
+// Returns the 3 access bytes (bytes 6,7,8 of the sector trailer).
+void encodeAccessBits(uint8_t c1[4], uint8_t c2[4], uint8_t c3[4], uint8_t accessBytes[3]) {
+  // Byte 6: ~C2_3 ~C2_2 ~C2_1 ~C2_0 ~C1_3 ~C1_2 ~C1_1 ~C1_0
+  accessBytes[0] = ((~c2[3] & 1) << 7) | ((~c2[2] & 1) << 6) | ((~c2[1] & 1) << 5) | ((~c2[0] & 1) << 4) |
+                   ((~c1[3] & 1) << 3) | ((~c1[2] & 1) << 2) | ((~c1[1] & 1) << 1) | (~c1[0] & 1);
+  // Byte 7: C1_3 C1_2 C1_1 C1_0 ~C3_3 ~C3_2 ~C3_1 ~C3_0
+  accessBytes[1] = ((c1[3] & 1) << 7) | ((c1[2] & 1) << 6) | ((c1[1] & 1) << 5) | ((c1[0] & 1) << 4) |
+                   ((~c3[3] & 1) << 3) | ((~c3[2] & 1) << 2) | ((~c3[1] & 1) << 1) | (~c3[0] & 1);
+  // Byte 8: C3_3 C3_2 C3_1 C3_0 C2_3 C2_2 C2_1 C2_0
+  accessBytes[2] = ((c3[3] & 1) << 7) | ((c3[2] & 1) << 6) | ((c3[1] & 1) << 5) | ((c3[0] & 1) << 4) |
+                   ((c2[3] & 1) << 3) | ((c2[2] & 1) << 2) | ((c2[1] & 1) << 1) | (c2[0] & 1);
+}
+
+void cmdChangeAccessBits(uint8_t *uid, uint8_t uidLen) {
+  Serial.println("\n  == Change Access Conditions ==");
+  Serial.println("  Presets:");
+  Serial.println("    1 = Default (transport: key A|B read/write all)");
+  Serial.println("    2 = Read-only with key A|B (no write)");
+  Serial.println("    3 = Never read/write data blocks (hidden data)");
+  Serial.println("    4 = Write with key B only, read with A|B");
+  Serial.println("    5 = Custom (enter raw access bytes)");
+
+  int sector = readSerialInt("  Sector number (0-15): ", 30000);
+  if (sector < 0 || sector > 15) {
+    Serial.println("  Cancelled.");
+    return;
+  }
+
+  int preset = readSerialInt("  Preset (1-5): ", 30000);
+  if (preset < 1 || preset > 5) {
+    Serial.println("  Cancelled.");
+    return;
+  }
+
+  uint8_t trailerBlock = sector * 4 + 3;
+
+  // Authenticate
+  Serial.println("  Authenticating...");
+  if (tryAuthBlock(uid, uidLen, trailerBlock, 0) < 0 &&
+      tryAuthBlock(uid, uidLen, trailerBlock, 1) < 0) {
+    Serial.println("  AUTH FAILED.");
+    return;
+  }
+
+  // Read current trailer
+  uint8_t trailer[16];
+  if (!nfc.mifareclassic_ReadDataBlock(trailerBlock, trailer)) {
+    Serial.println("  Failed to read trailer.");
+    return;
+  }
+
+  uint8_t accessBytes[3];
+
+  if (preset == 5) {
+    // Custom: enter 3 raw bytes
+    Serial.println("  Enter 3 access bytes hex (e.g. FF 07 80):");
+    Serial.print("  > ");
+    char hexInput[20];
+    if (readSerialLine(hexInput, sizeof(hexInput), 60000) == 0) {
+      Serial.println("  Cancelled.");
+      return;
+    }
+    Serial.println(hexInput);
+    uint8_t cnt = 0;
+    char *tok = strtok(hexInput, " ,:");
+    while (tok && cnt < 3) {
+      int val = parseHexByte(tok);
+      if (val < 0) { Serial.println("  Invalid hex."); return; }
+      accessBytes[cnt++] = (uint8_t)val;
+      tok = strtok(NULL, " ,:");
+    }
+    if (cnt != 3) { Serial.println("  Need 3 bytes."); return; }
+  } else {
+    // C1, C2, C3 for blocks 0,1,2,3 (block 3 = trailer)
+    uint8_t c1[4], c2[4], c3[4];
+    switch (preset) {
+      case 1: // Default transport: C1=C2=C3=0 for data, trailer C1=0 C2=0 C3=1
+        c1[0]=0; c2[0]=0; c3[0]=0;  // block 0: key A|B r/w
+        c1[1]=0; c2[1]=0; c3[1]=0;  // block 1
+        c1[2]=0; c2[2]=0; c3[2]=0;  // block 2
+        c1[3]=0; c2[3]=0; c3[3]=1;  // trailer: key A write, key A read access, key A r/w key B
+        break;
+      case 2: // Read-only: C1=0 C2=1 C3=0 for data
+        c1[0]=0; c2[0]=1; c3[0]=0;
+        c1[1]=0; c2[1]=1; c3[1]=0;
+        c1[2]=0; c2[2]=1; c3[2]=0;
+        c1[3]=0; c2[3]=0; c3[3]=1;  // trailer: manageable with key A
+        break;
+      case 3: // Never read/write data: C1=1 C2=1 C3=1
+        c1[0]=1; c2[0]=1; c3[0]=1;
+        c1[1]=1; c2[1]=1; c3[1]=1;
+        c1[2]=1; c2[2]=1; c3[2]=1;
+        c1[3]=0; c2[3]=0; c3[3]=1;  // keep trailer accessible with key A
+        break;
+      case 4: // Write key B only: C1=1 C2=0 C3=0 data
+        c1[0]=1; c2[0]=0; c3[0]=0;
+        c1[1]=1; c2[1]=0; c3[1]=0;
+        c1[2]=1; c2[2]=0; c3[2]=0;
+        c1[3]=0; c2[3]=0; c3[3]=1;
+        break;
+      default:
+        Serial.println("  Invalid preset.");
+        return;
+    }
+    encodeAccessBits(c1, c2, c3, accessBytes);
+  }
+
+  // Update trailer bytes 6,7,8 with new access bits (keep byte 9 / user data)
+  trailer[6] = accessBytes[0];
+  trailer[7] = accessBytes[1];
+  trailer[8] = accessBytes[2];
+
+  Serial.print("  New trailer: ");
+  for (uint8_t i = 0; i < 16; i++) {
+    printHex(trailer[i]);
+    Serial.print(" ");
+  }
+  Serial.println();
+  Serial.print("  Access bytes: ");
+  printHex(accessBytes[0]); Serial.print(" ");
+  printHex(accessBytes[1]); Serial.print(" ");
+  printHex(accessBytes[2]); Serial.println();
+
+  Serial.print("  Confirm write? (y/n): ");
+  char confirm[4];
+  readSerialLine(confirm, sizeof(confirm), 15000);
+  Serial.println(confirm);
+  if (confirm[0] != 'y' && confirm[0] != 'Y') {
+    Serial.println("  Cancelled.");
+    return;
+  }
+
+  reselectCard();
+  if (tryAuthBlock(uid, uidLen, trailerBlock, 0) < 0 &&
+      tryAuthBlock(uid, uidLen, trailerBlock, 1) < 0) {
+    Serial.println("  Re-auth failed.");
+    return;
+  }
+
+  if (nfc.mifareclassic_WriteDataBlock(trailerBlock, trailer)) {
+    Serial.print("  Sector ");
+    Serial.print(sector);
+    Serial.println(" access conditions updated OK.");
+  } else {
+    Serial.println("  WRITE FAILED.");
+  }
+}
+
+// ============================================================
+// Feature 4: Format Classic for NDEF + write URI (exercise 9)
+// ============================================================
+
+void cmdFormatNdefClassic(uint8_t *uid, uint8_t uidLen) {
+  Serial.println("\n  == Format MIFARE Classic for NDEF + Write URI ==");
+  Serial.println("  WARNING: This will overwrite sector 0 (MAD) and a data sector!");
+
+  Serial.println("  NDEF URI prefixes:");
+  Serial.println("    0 = (none)     1 = http://www.   2 = https://www.");
+  Serial.println("    3 = http://    4 = https://      5 = tel:");
+  Serial.println("    6 = mailto:");
+
+  int prefix = readSerialInt("  URI prefix code (0-6): ", 30000);
+  if (prefix < 0 || prefix > 0x23) {
+    Serial.println("  Cancelled.");
+    return;
+  }
+
+  Serial.println("  Enter URL/text (max 38 chars, without prefix):");
+  Serial.print("  > ");
+  char url[48];
+  if (readSerialLine(url, sizeof(url), 60000) == 0) {
+    Serial.println("  Cancelled.");
+    return;
+  }
+  Serial.println(url);
+
+  if (strlen(url) < 1 || strlen(url) > 38) {
+    Serial.println("  URL must be 1-38 characters.");
+    return;
+  }
+
+  Serial.print("  Will write: ");
+  if (prefix < NUM_URI_PREFIXES) Serial.print(URI_PREFIXES[prefix]);
+  Serial.println(url);
+
+  Serial.print("  Confirm? (y/n): ");
+  char confirm[4];
+  readSerialLine(confirm, sizeof(confirm), 15000);
+  Serial.println(confirm);
+  if (confirm[0] != 'y' && confirm[0] != 'Y') {
+    Serial.println("  Cancelled.");
+    return;
+  }
+
+  // Step 1: Authenticate sector 0 with default key
+  Serial.println("  Authenticating sector 0...");
+  uint8_t defaultKey[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  if (!nfc.mifareclassic_AuthenticateBlock(uid, uidLen, 0, 0, defaultKey)) {
+    Serial.println("  Cannot auth sector 0. Already formatted?");
+    // Try MAD key
+    uint8_t madKey[6] = {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5};
+    reselectCard();
+    if (!nfc.mifareclassic_AuthenticateBlock(uid, uidLen, 0, 0, madKey)) {
+      Serial.println("  Cannot auth sector 0 with MAD key either. Aborting.");
+      return;
+    }
+    Serial.println("  (Authenticated with MAD key - card may already be formatted)");
+  }
+
+  // Step 2: Format sector 0 as MAD
+  Serial.println("  Formatting sector 0 (MAD)...");
+  if (!nfc.mifareclassic_FormatNDEF()) {
+    Serial.println("  FormatNDEF failed.");
+    return;
+  }
+  Serial.println("  MAD written to sector 0.");
+
+  // Step 3: Authenticate sector 1 and write NDEF URI
+  Serial.println("  Authenticating sector 1...");
+  reselectCard();
+  if (!nfc.mifareclassic_AuthenticateBlock(uid, uidLen, 4, 0, defaultKey)) {
+    // Try NDEF key since FormatNDEF may have changed things
+    uint8_t ndefKey[6] = {0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7};
+    reselectCard();
+    if (!nfc.mifareclassic_AuthenticateBlock(uid, uidLen, 4, 0, ndefKey)) {
+      Serial.println("  Cannot auth sector 1. Aborting.");
+      return;
+    }
+  }
+
+  Serial.println("  Writing NDEF URI to sector 1...");
+  if (nfc.mifareclassic_WriteNDEFURI(1, (uint8_t)prefix, url)) {
+    Serial.println("  NDEF URI written OK!");
+    Serial.println("  Tap this card on an NFC phone to trigger the action.");
+  } else {
+    Serial.println("  WriteNDEFURI failed.");
+  }
+}
+
+// ============================================================
+// Feature 5: Ultralight C 3DES Authentication (agenda item)
+// ============================================================
+
+// Rotate a buffer left by 8 bits (1 byte)
+static void rotateLeft8(uint8_t *buf, uint8_t len) {
+  if (len < 2) return;
+  uint8_t first = buf[0];
+  memmove(buf, buf + 1, len - 1);
+  buf[len - 1] = first;
+}
+
+// 2-key 3DES CBC encrypt (8 bytes at a time)
+static void des3CbcEncrypt(uint8_t *key, uint8_t *iv, uint8_t *data, uint8_t len) {
+  mbedtls_des3_context ctx;
+  mbedtls_des3_init(&ctx);
+  mbedtls_des3_set2key_enc(&ctx, key);
+  mbedtls_des3_crypt_cbc(&ctx, MBEDTLS_DES_ENCRYPT, len, iv, data, data);
+  mbedtls_des3_free(&ctx);
+}
+
+// 2-key 3DES CBC decrypt (8 bytes at a time)
+static void des3CbcDecrypt(uint8_t *key, uint8_t *iv, uint8_t *data, uint8_t len) {
+  mbedtls_des3_context ctx;
+  mbedtls_des3_init(&ctx);
+  mbedtls_des3_set2key_dec(&ctx, key);
+  mbedtls_des3_crypt_cbc(&ctx, MBEDTLS_DES_DECRYPT, len, iv, data, data);
+  mbedtls_des3_free(&ctx);
+}
+
+bool authenticateUltralightC(uint8_t *key16) {
+  // Step 1: Send AUTHENTICATE command (0x1A, 0x00)
+  uint8_t cmd1[2] = {0x1A, 0x00};
+  uint8_t response[32];
+  uint8_t respLen = sizeof(response);
+
+  if (!nfc.inDataExchange(cmd1, 2, response, &respLen)) {
+    Serial.println("  Auth step 1 failed (no response).");
+    return false;
+  }
+
+  // Response should be: AF + 8 bytes (ek(RndB))
+  if (respLen < 9 || response[0] != 0xAF) {
+    Serial.println("  Auth step 1: unexpected response.");
+    return false;
+  }
+
+  uint8_t ekRndB[8];
+  memcpy(ekRndB, response + 1, 8);
+
+  // Decrypt ek(RndB) to get RndB
+  uint8_t iv[8];
+  memset(iv, 0, 8);
+  uint8_t rndB[8];
+  memcpy(rndB, ekRndB, 8);
+  des3CbcDecrypt(key16, iv, rndB, 8);
+
+  // Generate RndA (random 8 bytes)
+  uint8_t rndA[8];
+  for (int i = 0; i < 8; i++) rndA[i] = (uint8_t)esp_random();
+
+  // Compute RndB' = rotate RndB left by 8 bits
+  uint8_t rndBprime[8];
+  memcpy(rndBprime, rndB, 8);
+  rotateLeft8(rndBprime, 8);
+
+  // Concatenate RndA || RndB'
+  uint8_t concat[16];
+  memcpy(concat, rndA, 8);
+  memcpy(concat + 8, rndBprime, 8);
+
+  // Encrypt with IV = ek(RndB) (the original encrypted bytes)
+  uint8_t iv2[8];
+  memcpy(iv2, ekRndB, 8);
+  des3CbcEncrypt(key16, iv2, concat, 16);
+
+  // Step 3: Send AF + encrypted(RndA || RndB')
+  uint8_t cmd2[17];
+  cmd2[0] = 0xAF;
+  memcpy(cmd2 + 1, concat, 16);
+  respLen = sizeof(response);
+
+  if (!nfc.inDataExchange(cmd2, 17, response, &respLen)) {
+    Serial.println("  Auth step 3 failed (no response).");
+    return false;
+  }
+
+  // Response should be: 00 + 8 bytes (ek(RndA'))
+  if (respLen < 9 || response[0] != 0x00) {
+    Serial.println("  Auth step 3: rejected (wrong key?).");
+    return false;
+  }
+
+  // Verify: decrypt the response to get RndA', compare with rotate(RndA)
+  uint8_t ekRndAprime[8];
+  memcpy(ekRndAprime, response + 1, 8);
+  uint8_t iv3[8];
+  memcpy(iv3, concat + 8, 8);  // IV = last 8 bytes sent
+  des3CbcDecrypt(key16, iv3, ekRndAprime, 8);
+
+  uint8_t rndAprime[8];
+  memcpy(rndAprime, rndA, 8);
+  rotateLeft8(rndAprime, 8);
+
+  if (memcmp(ekRndAprime, rndAprime, 8) != 0) {
+    Serial.println("  Auth verification failed (RndA' mismatch).");
+    return false;
+  }
+
+  return true;
+}
+
+void cmdAuthUltralightC(void) {
+  Serial.println("\n  == Ultralight C 3DES Authentication ==");
+  Serial.println("  Default key: 49 45 4D 4B 41 45 52 42 21 4E 41 43 55 4F 59 46");
+  Serial.println("               (\"IEMKAERB!NACUOYF\" = \"BREAKMEIFYOUCAN!\" reversed)");
+
+  Serial.println("  Use default key? (y/n): ");
+  char choice[4];
+  readSerialLine(choice, sizeof(choice), 15000);
+  Serial.println(choice);
+
+  uint8_t key[16];
+
+  if (choice[0] == 'n' || choice[0] == 'N') {
+    Serial.println("  Enter 16-byte key as hex:");
+    Serial.print("  > ");
+    char hexInput[64];
+    if (readSerialLine(hexInput, sizeof(hexInput), 60000) == 0) {
+      Serial.println("  Cancelled.");
+      return;
+    }
+    Serial.println(hexInput);
+    uint8_t cnt = 0;
+    char *tok = strtok(hexInput, " ,:");
+    while (tok && cnt < 16) {
+      int val = parseHexByte(tok);
+      if (val < 0) { Serial.println("  Invalid hex."); return; }
+      key[cnt++] = (uint8_t)val;
+      tok = strtok(NULL, " ,:");
+    }
+    if (cnt != 16) {
+      Serial.println("  Need exactly 16 bytes.");
+      return;
+    }
+  } else {
+    // Default Ultralight C key (reverse of "BREAKMEIFYOUCAN!")
+    uint8_t defaultKey[16] = {
+      0x49, 0x45, 0x4D, 0x4B, 0x41, 0x45, 0x52, 0x42,
+      0x21, 0x4E, 0x41, 0x43, 0x55, 0x4F, 0x59, 0x46
+    };
+    memcpy(key, defaultKey, 16);
+  }
+
+  Serial.print("  Key: ");
+  for (int i = 0; i < 16; i++) {
+    printHex(key[i]);
+    Serial.print(" ");
+  }
+  Serial.println();
+
+  Serial.println("  Authenticating...");
+  if (authenticateUltralightC(key)) {
+    Serial.println("  3DES Authentication SUCCESS!");
+  } else {
+    Serial.println("  3DES Authentication FAILED.");
+  }
+}
+
+// ============================================================
+// Interactive menu
+// ============================================================
+
+void printMenu(TagType type) {
+  Serial.println("\n  --- Actions Menu ---");
+  Serial.println("  0 = Scan next tag (exit menu)");
+  if (type == TAG_MIFARE_CLASSIC_1K || type == TAG_MIFARE_CLASSIC_4K) {
+    Serial.println("  1 = Write data to a block");
+    Serial.println("  2 = Change Key A on a sector");
+    Serial.println("  3 = Change access conditions on a sector");
+    Serial.println("  4 = Format for NDEF + write URI");
+  }
+  if (type == TAG_MIFARE_ULTRALIGHT) {
+    Serial.println("  5 = Authenticate Ultralight C (3DES)");
+  }
+  Serial.print("  Choice: ");
+}
+
+// Run the interactive menu. Returns when user chooses 0 or timeout.
+void interactiveMenu(uint8_t *uid, uint8_t uidLen, TagInfo tag) {
+  while (true) {
+    printMenu(tag.type);
+    char buf[4];
+    if (readSerialLine(buf, sizeof(buf), 60000) == 0) {
+      Serial.println("\n  (Timeout - returning to scan mode)");
+      break;
+    }
+    Serial.println(buf);
+    int choice = atoi(buf);
+
+    if (choice == 0) break;
+
+    if (tag.type == TAG_MIFARE_CLASSIC_1K || tag.type == TAG_MIFARE_CLASSIC_4K) {
+      switch (choice) {
+        case 1: cmdWriteClassicBlock(uid, uidLen); break;
+        case 2: cmdChangeKey(uid, uidLen); break;
+        case 3: cmdChangeAccessBits(uid, uidLen); break;
+        case 4: cmdFormatNdefClassic(uid, uidLen); break;
+        default: Serial.println("  Invalid choice."); break;
+      }
+    } else if (tag.type == TAG_MIFARE_ULTRALIGHT) {
+      if (choice == 5) {
+        cmdAuthUltralightC();
+      } else {
+        Serial.println("  Invalid choice.");
+      }
+    }
+
+    // Re-select card for next operation
+    reselectCard();
+  }
+}
+
+// ============================================================
+// Setup & Loop
+// ============================================================
+
 void setup() {
   Serial.begin(115200);
   while (!Serial) delay(10);
@@ -728,7 +1439,10 @@ void loop() {
       Serial.println("  (Memory dump not supported for this tag type)");
     }
 
-    Serial.println();
-    delay(2000);
+    // Show interactive menu for write operations
+    interactiveMenu(uid, uidLength, tag);
+
+    Serial.println("\nReady. Scan a tag...\n");
+    delay(1000);
   }
 }
